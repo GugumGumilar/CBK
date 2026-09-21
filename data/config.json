@@ -1,0 +1,7 @@
+{
+  "telegramBotToken": "8842071081:AAHdy5gZH591U4zyWlmBhWtRlCgDfrIP2_k",
+  "botUsername": "CatatBonEvi_bot",
+  "googleSheetsWebhookUrl": "https://script.google.com/macros/s/AKfycbwmgNY-HFcjlQDOFKkG8oP0bKCNwrpzK1dESVTEWbw5v-0FOS-v-JEv_3k25yXHcIanPQ/exec",
+  "currency": "IDR",
+  "autoSyncToSheets": true
+}

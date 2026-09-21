@@ -1,0 +1,6 @@
+{
+  "name": "Catat Belanja Telegram & OCR Bon",
+  "description": "Pencatat belanja otomatis via Telegram bot dengan OCR foto struk cerdas, input manual, dan integrasi Spreadsheet untuk iPhone dan web.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
