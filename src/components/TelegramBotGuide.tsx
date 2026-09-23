@@ -15,6 +15,10 @@ import {
   MessageSquare,
   ShieldCheck,
   Key,
+  Zap,
+  Globe,
+  Radio,
+  Wifi,
 } from 'lucide-react';
 import { AppConfig, SystemStatus } from '../types';
 
@@ -23,6 +27,7 @@ interface TelegramBotGuideProps {
   status: SystemStatus | null;
   onUpdateConfig: (updates: Partial<AppConfig>) => Promise<void>;
   onRefreshStatus: () => Promise<void>;
+  onOpenSheetsModal?: () => void;
 }
 
 export function TelegramBotGuide({
@@ -30,9 +35,13 @@ export function TelegramBotGuide({
   status,
   onUpdateConfig,
   onRefreshStatus,
+  onOpenSheetsModal,
 }: TelegramBotGuideProps) {
   const [tokenInput, setTokenInput] = useState(config.telegramBotToken || '');
   const [isConnecting, setIsConnecting] = useState(false);
+  const [isSwitchingMode, setIsSwitchingMode] = useState(false);
+  const [isTestingWebhook, setIsTestingWebhook] = useState(false);
+  const [testWebhookResult, setTestWebhookResult] = useState<any>(null);
   const [connectMessage, setConnectMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [copiedText, setCopiedText] = useState<string | null>(null);
 
@@ -52,10 +61,10 @@ export function TelegramBotGuide({
     setTimeout(() => setCopiedText(null), 2000);
   };
 
-  const handleSetWebhook = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!tokenInput.trim()) {
-      setConnectMessage({ type: 'error', text: 'Mohon masukkan Bot Token dari @BotFather.' });
+  // 1-Click Automatic Webhook Activation
+  const handleAutoWebhook = async () => {
+    if (!tokenInput.trim() && !config.telegramBotToken) {
+      setConnectMessage({ type: 'error', text: 'Mohon masukkan Bot Token dari @BotFather terlebih dahulu.' });
       return;
     }
 
@@ -63,37 +72,97 @@ export function TelegramBotGuide({
     setConnectMessage(null);
 
     try {
-      const res = await fetch('/api/telegram/set-webhook', {
+      const publicUrl = window.location.origin;
+      const res = await fetch('/api/telegram/auto-webhook', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          botToken: tokenInput.trim(),
+          botToken: tokenInput.trim() || config.telegramBotToken,
+          publicUrl,
         }),
       });
 
       const data = await res.json();
       if (!res.ok || !data.success) {
-        throw new Error(data.error || data.telegramResponse?.description || 'Gagal mengatur webhook');
+        throw new Error(data.error || 'Gagal mengaktifkan mode webhook otomatis');
       }
 
       setConnectMessage({
         type: 'success',
-        text: `Sukses terhubung! Bot @${data.botInfo?.username || 'kamu'} sudah aktif menerima foto bon & pesan dari iPhone!`,
+        text: `⚡ Mode Webhook Otomatis Berhasil Aktif! Telegram resmi didaftarkan ke: ${data.webhookUrl}. Bot @${data.botInfo?.username || 'kamu'} sekarang langsung merespons setiap kali Anda chat di Telegram!`,
       });
 
       await onUpdateConfig({
-        telegramBotToken: tokenInput.trim(),
+        telegramBotToken: tokenInput.trim() || config.telegramBotToken,
         botUsername: data.botInfo?.username,
+        telegramMode: 'webhook',
+        registeredWebhookUrl: data.webhookUrl,
       });
       await onRefreshStatus();
     } catch (err: any) {
       setConnectMessage({
         type: 'error',
-        text: err.message || 'Gagal menghubungi server Telegram.',
+        text: err.message || 'Gagal menghubungkan webhook otomatis.',
       });
     } finally {
       setIsConnecting(false);
     }
+  };
+
+  // Switch between Webhook and Polling mode
+  const handleSwitchMode = async (mode: 'webhook' | 'polling') => {
+    setIsSwitchingMode(true);
+    setConnectMessage(null);
+    try {
+      const res = await fetch('/api/telegram/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode,
+          botToken: tokenInput.trim() || config.telegramBotToken,
+          publicUrl: window.location.origin,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Gagal mengganti mode bot');
+      }
+      setConnectMessage({
+        type: 'success',
+        text:
+          mode === 'webhook'
+            ? '⚡ Berhasil beralih ke Mode Webhook Otomatis! Respon Telegram seketika (push real-time).'
+            : '🔄 Berhasil beralih ke Mode Polling! Bot aktif menarik pesan berkala.',
+      });
+      await onUpdateConfig({ telegramMode: mode });
+      await onRefreshStatus();
+    } catch (err: any) {
+      setConnectMessage({
+        type: 'error',
+        text: err.message || 'Gagal mengubah mode bot.',
+      });
+    } finally {
+      setIsSwitchingMode(false);
+    }
+  };
+
+  // Test webhook endpoint ping
+  const handleTestWebhook = async () => {
+    setIsTestingWebhook(true);
+    try {
+      const res = await fetch('/api/telegram/test-webhook', { method: 'POST' });
+      const data = await res.json();
+      setTestWebhookResult(data);
+    } catch (e: any) {
+      setTestWebhookResult({ error: e.message });
+    } finally {
+      setIsTestingWebhook(false);
+    }
+  };
+
+  const handleSetWebhook = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await handleAutoWebhook();
   };
 
   const handleSimSend = async (e: React.FormEvent) => {
@@ -247,6 +316,35 @@ export function TelegramBotGuide({
         </div>
       </div>
 
+      {/* 24/7 Always-On Explanation & Solution Banner */}
+      <div className="bg-gradient-to-r from-amber-500/10 via-indigo-500/10 to-emerald-500/10 border border-indigo-200/90 rounded-2xl p-4 sm:p-5 shadow-xs">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse"></span>
+              <h3 className="text-xs sm:text-sm font-bold text-slate-900">
+                Kenapa Bot Tidak Merespon Kalau Ditinggal Lama Tanpa Buka AI Studio?
+              </h3>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed max-w-3xl">
+              <b>Penyebabnya:</b> Container preview di AI Studio otomatis masuk mode <i>tidur (scale-to-zero)</i> jika 10-15 menit tidak dibuka untuk menghemat server. Saat Anda buka AI Studio kembali, container bangun dan baru membalas pesan.
+            </p>
+            <p className="text-xs text-indigo-900 font-medium pt-0.5">
+              ⭐ <b>Solusi 100% Gratis & Selalu Online 24/7:</b> Hubungkan Telegram langsung ke <b>Google Apps Script di Google Sheets Anda</b>. Google Apps Script tidak pernah tidur, membaca teks & foto struk dengan Gemini AI, dan langsung membalas dalam hitungan detik 24 jam non-stop!
+            </p>
+          </div>
+          {onOpenSheetsModal && (
+            <button
+              onClick={onOpenSheetsModal}
+              className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-xs shrink-0 transition-colors cursor-pointer"
+            >
+              <Zap className="w-3.5 h-3.5" />
+              Aktifkan Mode 24/7
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* 3-Step Setup Guide */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {/* Step 1 */}
@@ -322,27 +420,67 @@ export function TelegramBotGuide({
           </p>
           <ul className="mt-2 text-xs text-slate-600 space-y-1.5 list-disc list-inside">
             <li><b>Lihat Data Belanja:</b> Ketik <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">/daftar</code> untuk melihat list dengan tombol <b>Edit (✏️)</b> & <b>Hapus (🗑️)</b>.</li>
-            <li><b>Hapus Semua Data:</b> Ketik <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">/hapussemua</code> atau <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">/reset</code> untuk mengosongkan seluruh belanjaan dengan konfirmasi aman.</li>
-            <li><b>Foto Bon:</b> Tekan ikon kamera Telegram & kirim struk belanja.</li>
+            <li><b>Batas Budget:</b> Ketik <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">/budget 3jt</code> untuk mengatur batas belanja & lacak sisa uang bulanan.</li>
+            <li><b>Foto Bon:</b> Tekan ikon kamera Telegram & kirim struk belanja (kirim 1 atau 3 foto sekaligus).</li>
             <li><b>Ketik Manual:</b> Contoh: <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">Beras 5kg 75000</code></li>
-            <li><b>Cek Pengeluaran:</b> Ketik <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">/rekap</code></li>
+            <li><b>Cek Pengeluaran & Sisa:</b> Ketik <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">/rekap</code></li>
+            <li><b>Hapus Semua Data:</b> Ketik <code className="text-slate-800 font-mono bg-slate-100 px-1 py-0.5 rounded">/hapus_semua</code> untuk mengosongkan seluruh data belanja & Google Sheets.</li>
           </ul>
         </div>
       </div>
 
       {/* Webhook Configuration Form */}
       <div className="bg-white p-5 sm:p-6 rounded-xl border border-slate-200 shadow-xs">
-        <div className="flex items-center gap-2.5 mb-4">
-          <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center">
-            <Key className="w-4 h-4" />
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center">
+              <Zap className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-slate-900">
+                  Mode Webhook Otomatis Telegram
+                </h3>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                  <Zap className="w-3 h-3 text-emerald-600" />
+                  Otomatis & Real-Time Push
+                </span>
+              </div>
+              <p className="text-xs text-slate-500">
+                Setiap kali Anda chat di Telegram, Telegram langsung mengirim pesan ke server ini seketika
+              </p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-sm font-bold text-slate-900">
-              Pengaturan Bot Token & Webhook Telegram
-            </h3>
-            <p className="text-xs text-slate-500">
-              Masukkan token bot dari BotFather untuk mengaktifkan bot secara live
-            </p>
+
+          <div className="flex items-center gap-1.5 self-start sm:self-auto">
+            <button
+              type="button"
+              id="btn-switch-webhook"
+              onClick={() => handleSwitchMode('webhook')}
+              disabled={isSwitchingMode || status?.telegramMode === 'webhook'}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                status?.telegramMode === 'webhook'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+              }`}
+            >
+              <Zap className="w-3.5 h-3.5" />
+              Webhook Otomatis
+            </button>
+            <button
+              type="button"
+              id="btn-switch-polling"
+              onClick={() => handleSwitchMode('polling')}
+              disabled={isSwitchingMode || status?.telegramMode === 'polling'}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                status?.telegramMode === 'polling'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              Mode Polling
+            </button>
           </div>
         </div>
 
@@ -359,7 +497,7 @@ export function TelegramBotGuide({
             ) : (
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600" />
             )}
-            <p className="font-medium">{connectMessage.text}</p>
+            <p className="font-medium leading-relaxed">{connectMessage.text}</p>
           </div>
         )}
 
@@ -386,16 +524,78 @@ export function TelegramBotGuide({
                 {isConnecting ? (
                   <>
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    Menghubungkan...
+                    Mendaftarkan Webhook...
                   </>
                 ) : (
                   <>
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    Simpan & Aktifkan Bot
+                    <Zap className="w-3.5 h-3.5" />
+                    Aktifkan Webhook Otomatis
                   </>
                 )}
               </button>
             </div>
+          </div>
+
+          {/* Webhook Details & Telegram Diagnostics */}
+          <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5 text-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+              <span className="text-slate-500 font-medium">URL Webhook Aplikasi Saat Ini:</span>
+              <div className="flex items-center gap-2 bg-white px-2.5 py-1 rounded-lg border border-slate-200 font-mono text-[11px] text-slate-800">
+                <span className="truncate max-w-[280px] sm:max-w-md">
+                  {typeof window !== 'undefined' ? `${window.location.origin}/api/telegram/webhook` : '/api/telegram/webhook'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleCopy(
+                      `${window.location.origin}/api/telegram/webhook`,
+                      'webhook-url'
+                    )
+                  }
+                  className="text-slate-400 hover:text-slate-700 cursor-pointer"
+                  title="Salin URL Webhook"
+                >
+                  {copiedText === 'webhook-url' ? (
+                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                  ) : (
+                    <Copy className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t border-slate-200/80">
+              <div className="flex items-center justify-between bg-white p-2 rounded-lg border border-slate-200">
+                <span className="text-slate-500 text-[11px]">Terdaftar di Server Telegram:</span>
+                {status?.webhookInfo?.url ? (
+                  <span className="inline-flex items-center gap-1 font-bold text-emerald-700 text-[11px]">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    Aktif & Terdaftar
+                  </span>
+                ) : (
+                  <span className="text-[11px] font-medium text-amber-700">
+                    {status?.isPolling ? 'Beralih ke Polling' : 'Belum Didaftarkan'}
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between bg-white p-2 rounded-lg border border-slate-200">
+                <span className="text-slate-500 text-[11px]">Antrean Pesan Telegram:</span>
+                <span className="font-bold text-slate-800 text-[11px]">
+                  {status?.webhookInfo?.pending_update_count ?? 0} update pending
+                </span>
+              </div>
+            </div>
+
+            {status?.webhookInfo?.last_error_message && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-[11px] flex items-start gap-2">
+                <AlertCircle className="w-3.5 h-3.5 text-rose-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold">Laporan Kesalahan dari Telegram:</span>{' '}
+                  {status.webhookInfo.last_error_message}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Bot Connection & Real-Time Status Info */}
@@ -408,8 +608,9 @@ export function TelegramBotGuide({
                     <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
                     Online (@{status.botInfo?.username || 'Bot'})
                   </span>
-                  <span className="text-[11px] text-slate-500 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">
-                    Mode Real-Time Aktif
+                  <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50/70 px-2 py-0.5 rounded border border-emerald-200 flex items-center gap-1">
+                    <Zap className="w-3 h-3" />
+                    {status.telegramMode === 'webhook' ? 'Mode Webhook Otomatis' : 'Mode Polling'}
                   </span>
                 </div>
               ) : (
@@ -423,14 +624,54 @@ export function TelegramBotGuide({
             <div className="flex items-center gap-2">
               <button
                 type="button"
+                id="btn-test-webhook"
+                onClick={handleTestWebhook}
+                disabled={isTestingWebhook}
+                className="inline-flex items-center gap-1 text-[11px] text-slate-700 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 px-2.5 py-1 rounded-lg border border-slate-300 transition-colors cursor-pointer"
+              >
+                {isTestingWebhook ? (
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Wifi className="w-3 h-3 text-emerald-600" />
+                )}
+                Uji Koneksi Webhook
+              </button>
+
+              <button
+                type="button"
                 onClick={() => onRefreshStatus()}
-                className="inline-flex items-center gap-1 text-[11px] text-slate-600 hover:text-slate-900 bg-slate-50 hover:bg-slate-100 px-2.5 py-1 rounded border border-slate-200 transition-colors cursor-pointer"
+                className="inline-flex items-center gap-1 text-[11px] text-slate-600 hover:text-slate-900 bg-slate-50 hover:bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200 transition-colors cursor-pointer"
               >
                 <RefreshCw className="w-3 h-3" />
                 Refresh Status
               </button>
             </div>
           </div>
+
+          {testWebhookResult && (
+            <div className="p-3 bg-slate-900 text-slate-100 rounded-xl text-[11px] font-mono space-y-1">
+              <div className="flex items-center justify-between text-slate-400 pb-1 border-b border-slate-800">
+                <span>Hasil Pengujian Webhook:</span>
+                <button
+                  type="button"
+                  onClick={() => setTestWebhookResult(null)}
+                  className="text-slate-400 hover:text-white cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+              <p>• Endpoint: {testWebhookResult.targetEndpoint}</p>
+              <p>• Terdaftar di Telegram: {testWebhookResult.configuredWebhookUrl || 'Belum'}</p>
+              <p>
+                • Status URL:{' '}
+                {testWebhookResult.isUrlMatching ? (
+                  <span className="text-emerald-400 font-bold">✅ Cocok & Siap Menerima Chat Real-Time</span>
+                ) : (
+                  <span className="text-amber-400 font-bold">⚠️ Belum sinkron dengan URL saat ini. Klik tombol "Aktifkan Webhook Otomatis" di atas.</span>
+                )}
+              </p>
+            </div>
+          )}
         </form>
       </div>
 

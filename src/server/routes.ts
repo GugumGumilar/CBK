@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { parseReceiptImage, parseTextExpense } from './geminiService';
+import { parseReceiptImage, parseTextExpense } from './geminiService.ts';
 import {
   downloadTelegramPhoto,
   getMe,
@@ -10,14 +10,14 @@ import {
   setTelegramWebhook,
   formatCurrencyIDR,
   TelegramUpdate,
-} from './telegramService';
-import { processTelegramUpdate } from './telegramProcessor';
+} from './telegramService.ts';
+import { processTelegramUpdate } from './telegramProcessor.ts';
 import {
   startTelegramPolling,
   stopTelegramPolling,
   isTelegramPollingActive,
   getPollingStatus,
-} from './telegramPolling';
+} from './telegramPolling.ts';
 import {
   addExpenses,
   addReceipt,
@@ -28,27 +28,40 @@ import {
   getReceipts,
   GroceryItem,
   ReceiptRecord,
+  syncExpensesFromSheets,
   updateConfig,
   updateExpense,
-} from './storageService';
+} from './storageService.ts';
 import {
   generateCsvContent,
   GOOGLE_APPS_SCRIPT_TEMPLATE,
   syncItemsToGoogleSheets,
-} from './sheetsService';
+  deleteItemsFromGoogleSheets,
+  updateItemInGoogleSheets,
+  clearAllFromGoogleSheets,
+  pullItemsFromGoogleSheets,
+} from './sheetsService.ts';
+import {
+  resolvePublicAppUrl,
+  setupTelegramAutoWebhook,
+  setTelegramConnectionMode,
+} from './webhookService.ts';
 
 export async function handleApiRequest(req: Request, res: Response): Promise<void> {
-  const url = req.url || '';
+  const rawUrl = req.url || '';
+  const pathname = rawUrl.split('?')[0];
+  const cleanPath = pathname.replace(/\/+$/, '') || '/';
   const method = req.method;
 
   try {
     // -------------------------------------------------------------
     // GET /api/status
     // -------------------------------------------------------------
-    if (method === 'GET' && (url === '/api/status' || url.startsWith('/api/status?'))) {
+    if (method === 'GET' && cleanPath === '/api/status') {
       const config = getConfig();
       const hasGeminiKey = !!process.env.GEMINI_API_KEY;
-      const appUrl = process.env.APP_URL || '';
+      const detectedPublicUrl = resolvePublicAppUrl(req);
+      const appUrl = process.env.APP_URL || detectedPublicUrl || '';
 
       let botInfo: any = null;
       let webhookInfo: any = null;
@@ -58,14 +71,34 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
           const me = await getMe(config.telegramBotToken);
           if (me.ok) {
             botInfo = me.result;
-            if (botInfo?.username) {
+            if (botInfo?.username && botInfo.username !== config.botUsername) {
               updateConfig({ botUsername: botInfo.username });
             }
           }
           webhookInfo = await getWebhookInfo(config.telegramBotToken);
-          // Auto-start polling if not active yet
-          if (!isTelegramPollingActive()) {
-            startTelegramPolling().catch(e => console.error('Error auto-starting telegram polling:', e));
+
+          if (config.telegramMode === 'webhook') {
+            // Mode Webhook: Stop polling to prevent Telegram 409 conflict
+            if (isTelegramPollingActive()) {
+              await stopTelegramPolling();
+            }
+
+            // If auto-webhook is enabled and we have a public URL, verify webhook is registered to this server
+            const targetWebhook = detectedPublicUrl ? `${detectedPublicUrl}/api/telegram/webhook` : '';
+            if (
+              config.autoWebhookEnabled !== false &&
+              targetWebhook &&
+              webhookInfo?.result?.url !== targetWebhook
+            ) {
+              console.log(`[Status] Auto-registering webhook to current domain: ${targetWebhook}`);
+              setupTelegramAutoWebhook({ req, publicUrl: detectedPublicUrl, token: config.telegramBotToken })
+                .catch(e => console.error('Error auto-registering webhook in status check:', e));
+            }
+          } else {
+            // Mode Polling: Auto-start polling if not active yet
+            if (!isTelegramPollingActive()) {
+              startTelegramPolling().catch(e => console.error('Error auto-starting telegram polling:', e));
+            }
           }
         } catch (e: any) {
           console.warn('Error fetching telegram info for status:', e.message);
@@ -77,6 +110,10 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
         status: 'ok',
         hasGeminiKey,
         appUrl,
+        detectedPublicUrl,
+        telegramMode: config.telegramMode || 'webhook',
+        autoWebhookEnabled: config.autoWebhookEnabled !== false,
+        registeredWebhookUrl: config.registeredWebhookUrl || webhookInfo?.result?.url || null,
         botConfigured: !!config.telegramBotToken,
         botInfo,
         webhookInfo: webhookInfo?.result || null,
@@ -91,56 +128,93 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // -------------------------------------------------------------
     // GET /api/config & POST /api/config
     // -------------------------------------------------------------
-    if (method === 'GET' && (url === '/api/config' || url.startsWith('/api/config?'))) {
+    if (method === 'GET' && cleanPath === '/api/config') {
       const config = getConfig();
+      const detectedPublicUrl = resolvePublicAppUrl(req);
       // Mask token for safety
       const maskedToken = config.telegramBotToken
         ? `${config.telegramBotToken.substring(0, 5)}...${config.telegramBotToken.substring(config.telegramBotToken.length - 4)}`
         : '';
+
+      let customizedTemplate = GOOGLE_APPS_SCRIPT_TEMPLATE;
+      if (config.telegramBotToken) {
+        customizedTemplate = customizedTemplate.replace(
+          'var TELEGRAM_BOT_TOKEN = "PASTE_TELEGRAM_BOT_TOKEN_DISINI";',
+          `var TELEGRAM_BOT_TOKEN = "${config.telegramBotToken}";`
+        );
+      }
+      if (process.env.GEMINI_API_KEY) {
+        customizedTemplate = customizedTemplate.replace(
+          'var GEMINI_API_KEY = "PASTE_GEMINI_API_KEY_DISINI";',
+          `var GEMINI_API_KEY = "${process.env.GEMINI_API_KEY}";`
+        );
+      }
 
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
         ...config,
         telegramBotTokenMasked: maskedToken,
         hasBotToken: !!config.telegramBotToken,
-        appsScriptTemplate: GOOGLE_APPS_SCRIPT_TEMPLATE,
-        appUrl: process.env.APP_URL || '',
+        hasGeminiKey: !!process.env.GEMINI_API_KEY,
+        detectedPublicUrl,
+        appsScriptTemplate: customizedTemplate,
+        appUrl: process.env.APP_URL || detectedPublicUrl || '',
       }));
       return;
     }
 
-    if (method === 'POST' && url === '/api/config') {
+    if (method === 'POST' && cleanPath === '/api/config') {
       const body = req.body || {};
       const updates: any = {};
       if (typeof body.telegramBotToken === 'string') updates.telegramBotToken = body.telegramBotToken.trim();
       if (typeof body.googleSheetsWebhookUrl === 'string') updates.googleSheetsWebhookUrl = body.googleSheetsWebhookUrl.trim();
       if (typeof body.autoSyncToSheets === 'boolean') updates.autoSyncToSheets = body.autoSyncToSheets;
       if (typeof body.currency === 'string') updates.currency = body.currency;
+      if (body.telegramMode === 'webhook' || body.telegramMode === 'polling') updates.telegramMode = body.telegramMode;
+      if (typeof body.autoWebhookEnabled === 'boolean') updates.autoWebhookEnabled = body.autoWebhookEnabled;
+      if (body.monthlyBudget !== undefined) {
+        const num = Number(body.monthlyBudget);
+        updates.monthlyBudget = isNaN(num) || num < 0 ? 0 : Math.round(num);
+      }
 
       const updated = updateConfig(updates);
-      if (updates.telegramBotToken !== undefined) {
-        if (updates.telegramBotToken) {
-          startTelegramPolling().catch(e => console.error('Error starting polling on config update:', e));
+
+      // Handle Telegram connection mode transition if token or mode is updated
+      if (updates.telegramBotToken !== undefined || updates.telegramMode !== undefined) {
+        const token = updates.telegramBotToken || updated.telegramBotToken;
+        const mode = updates.telegramMode || updated.telegramMode || 'webhook';
+
+        if (token) {
+          if (mode === 'webhook') {
+            setupTelegramAutoWebhook({ req, token }).catch(e =>
+              console.error('Error auto-setting webhook on config update:', e)
+            );
+          } else {
+            setTelegramConnectionMode('polling', { token }).catch(e =>
+              console.error('Error setting polling on config update:', e)
+            );
+          }
         } else {
           stopTelegramPolling().catch(e => console.error('Error stopping polling on config update:', e));
         }
       }
+
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({ success: true, config: updated }));
       return;
     }
 
     // -------------------------------------------------------------
-    // GET /api/expenses, POST /api/expenses, DELETE /api/expenses
+    // GET /api/expenses, POST /api/expenses, DELETE /api/expenses (all)
     // -------------------------------------------------------------
-    if (method === 'GET' && (url === '/api/expenses' || url.startsWith('/api/expenses?'))) {
+    if (method === 'GET' && cleanPath === '/api/expenses') {
       const items = getExpenses();
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({ items, totalCount: items.length }));
       return;
     }
 
-    if (method === 'POST' && url === '/api/expenses') {
+    if (method === 'POST' && cleanPath === '/api/expenses') {
       const body = req.body || {};
       const itemsToAdd: GroceryItem[] = [];
       const now = new Date();
@@ -199,34 +273,92 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
       return;
     }
 
-    if (method === 'DELETE' && url === '/api/expenses') {
+    if (
+      (method === 'DELETE' && (cleanPath === '/api/expenses' || cleanPath === '/api/expenses/clear' || cleanPath === '/api/expenses/clear-all')) ||
+      (method === 'POST' && (cleanPath === '/api/expenses/clear' || cleanPath === '/api/expenses/clear-all'))
+    ) {
+      const config = getConfig();
+      let sheetsCleared = false;
+      let sheetsMessage = '';
+      if (config.googleSheetsWebhookUrl) {
+        try {
+          const clearRes = await clearAllFromGoogleSheets(config.googleSheetsWebhookUrl);
+          sheetsCleared = clearRes.success;
+          sheetsMessage = clearRes.message;
+        } catch (err: any) {
+          console.error('Error clearing Google Sheets:', err);
+          sheetsMessage = err?.message || 'Gagal menghapus di spreadsheet';
+        }
+      }
       clearAllExpenses();
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ success: true, message: 'Semua data belanjaan telah dibersihkan.' }));
+      res.end(JSON.stringify({
+        success: true,
+        sheetsCleared,
+        message: 'Semua data belanjaan telah dibersihkan' + (sheetsCleared ? ' dari aplikasi dan Google Sheets.' : '.'),
+        sheetsMessage,
+      }));
       return;
     }
 
-    if (method === 'DELETE' && url.startsWith('/api/expenses/')) {
-      const id = url.replace('/api/expenses/', '').split('?')[0];
+    if (method === 'DELETE' && cleanPath.startsWith('/api/expenses/')) {
+      const id = cleanPath.replace('/api/expenses/', '').trim();
+      const existing = getExpenses().find(i => i.id === id);
       const ok = deleteExpense(id);
+
+      let sheetsDeleted = false;
+      let sheetsMessage = '';
+      const config = getConfig();
+      if (config.googleSheetsWebhookUrl && existing) {
+        try {
+          const syncRes = await deleteItemsFromGoogleSheets(
+            config.googleSheetsWebhookUrl,
+            [id],
+            [existing]
+          );
+          sheetsDeleted = syncRes.success;
+          sheetsMessage = syncRes.message;
+        } catch (err: any) {
+          console.error('Error deleting from Google Sheets:', err);
+          sheetsMessage = err.message || 'Gagal menghapus di Google Sheets';
+        }
+      }
+
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ success: ok, id }));
+      res.end(JSON.stringify({
+        success: ok,
+        id,
+        sheetsDeleted,
+        sheetsMessage,
+        itemName: existing?.name,
+      }));
       return;
     }
 
-    if (method === 'PUT' && url.startsWith('/api/expenses/')) {
-      const id = url.replace('/api/expenses/', '').split('?')[0];
+    if (method === 'PUT' && cleanPath.startsWith('/api/expenses/')) {
+      const id = cleanPath.replace('/api/expenses/', '').trim();
       const updated = updateExpense(id, req.body || {});
+
+      let sheetsUpdated = false;
+      const config = getConfig();
+      if (updated && config.googleSheetsWebhookUrl) {
+        try {
+          const syncRes = await updateItemInGoogleSheets(config.googleSheetsWebhookUrl, updated);
+          sheetsUpdated = syncRes.success;
+        } catch (err: any) {
+          console.error('Error updating in Google Sheets:', err);
+        }
+      }
+
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ success: !!updated, item: updated }));
+      res.end(JSON.stringify({ success: !!updated, item: updated, sheetsUpdated }));
       return;
     }
 
-    // -------------------------------------------------------------
     // -------------------------------------------------------------
     // POST /api/ocr (Direct OCR from Web / iPhone Camera)
     // -------------------------------------------------------------
-    if (method === 'POST' && url === '/api/ocr') {
+    if (method === 'POST' && cleanPath === '/api/ocr') {
       try {
         const { imageBase64, mimeType, autoSave } = req.body || {};
         if (!imageBase64) {
@@ -300,9 +432,10 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     }
 
     // -------------------------------------------------------------
+    // -------------------------------------------------------------
     // POST /api/parse-text (Natural language text parsing)
     // -------------------------------------------------------------
-    if (method === 'POST' && url === '/api/parse-text') {
+    if (method === 'POST' && cleanPath === '/api/parse-text') {
       try {
         const { text, autoSave } = req.body || {};
         if (!text) {
@@ -363,7 +496,7 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // -------------------------------------------------------------
     // POST /api/telegram/webhook (Telegram Server Webhook Receiver)
     // -------------------------------------------------------------
-    if (method === 'POST' && (url === '/api/telegram/webhook' || url.startsWith('/api/telegram/webhook'))) {
+    if (method === 'POST' && cleanPath === '/api/telegram/webhook') {
       const update: TelegramUpdate = req.body || {};
       // Immediately respond 200 OK to Telegram so it doesn't timeout
       res.setHeader('Content-Type', 'application/json');
@@ -378,7 +511,7 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // -------------------------------------------------------------
     // POST /api/telegram/start-polling
     // -------------------------------------------------------------
-    if (method === 'POST' && url === '/api/telegram/start-polling') {
+    if (method === 'POST' && cleanPath === '/api/telegram/start-polling') {
       const success = await startTelegramPolling();
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
@@ -391,7 +524,7 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // -------------------------------------------------------------
     // POST /api/telegram/stop-polling
     // -------------------------------------------------------------
-    if (method === 'POST' && url === '/api/telegram/stop-polling') {
+    if (method === 'POST' && cleanPath === '/api/telegram/stop-polling') {
       await stopTelegramPolling();
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
@@ -404,7 +537,7 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // -------------------------------------------------------------
     // GET /api/telegram/polling-status
     // -------------------------------------------------------------
-    if (method === 'GET' && (url === '/api/telegram/polling-status' || url.startsWith('/api/telegram/polling-status'))) {
+    if (method === 'GET' && cleanPath === '/api/telegram/polling-status') {
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
         success: true,
@@ -415,9 +548,66 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     }
 
     // -------------------------------------------------------------
+    // POST /api/telegram/auto-webhook (1-Click Automatic Webhook Setup)
+    // -------------------------------------------------------------
+    if (method === 'POST' && cleanPath === '/api/telegram/auto-webhook') {
+      const { botToken, publicUrl } = req.body || {};
+      const result = await setupTelegramAutoWebhook({
+        req,
+        publicUrl,
+        token: botToken,
+      });
+
+      if (!result.success) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: false, error: result.error }));
+        return;
+      }
+
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        success: true,
+        message: 'Mode Webhook Otomatis berhasil diaktifkan!',
+        webhookUrl: result.webhookUrl,
+        botInfo: result.botInfo,
+        webhookInfo: result.webhookInfo,
+      }));
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // POST /api/telegram/mode (Switch between Webhook and Polling)
+    // -------------------------------------------------------------
+    if (method === 'POST' && cleanPath === '/api/telegram/mode') {
+      const { mode, publicUrl, botToken } = req.body || {};
+      if (mode !== 'webhook' && mode !== 'polling') {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Mode harus "webhook" atau "polling"' }));
+        return;
+      }
+
+      try {
+        const result = await setTelegramConnectionMode(mode, {
+          req,
+          publicUrl,
+          token: botToken,
+        });
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ mode, ...result }));
+      } catch (err: any) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+      return;
+    }
+
+    // -------------------------------------------------------------
     // POST /api/telegram/set-webhook
     // -------------------------------------------------------------
-    if (method === 'POST' && url === '/api/telegram/set-webhook') {
+    if (method === 'POST' && cleanPath === '/api/telegram/set-webhook') {
       const { botToken, webhookUrl } = req.body || {};
       const token = (botToken || getConfig().telegramBotToken || '').trim();
 
@@ -445,21 +635,52 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
         botUsername: me.result?.username || '',
       });
 
-      // If user explicitly provided a custom webhook URL
-      let webhookSetResult: any = null;
-      if (webhookUrl && typeof webhookUrl === 'string' && webhookUrl.startsWith('https://')) {
-        webhookSetResult = await setTelegramWebhook(token, webhookUrl);
-      } else {
-        // Use Real-Time Long Polling (reliable in Cloud Run & development)
-        await startTelegramPolling();
+      // If user requested automatic webhook or provided URL
+      const autoRes = await setupTelegramAutoWebhook({
+        req,
+        publicUrl: webhookUrl,
+        token,
+      });
+
+      if (!autoRes.success) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          success: false,
+          error: autoRes.error,
+          botInfo: me.result,
+        }));
+        return;
       }
 
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
         success: true,
-        pollingActive: isTelegramPollingActive(),
-        botInfo: me.result,
-        telegramResponse: webhookSetResult,
+        pollingActive: false,
+        webhookUrl: autoRes.webhookUrl,
+        botInfo: autoRes.botInfo,
+        webhookInfo: autoRes.webhookInfo,
+      }));
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // POST /api/telegram/test-webhook
+    // -------------------------------------------------------------
+    if (method === 'POST' && cleanPath === '/api/telegram/test-webhook') {
+      const config = getConfig();
+      const detectedPublicUrl = resolvePublicAppUrl(req);
+      const targetEndpoint = `${detectedPublicUrl}/api/telegram/webhook`;
+      const webhookInfo = config.telegramBotToken ? await getWebhookInfo(config.telegramBotToken) : null;
+
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        success: true,
+        detectedPublicUrl,
+        targetEndpoint,
+        configuredWebhookUrl: config.registeredWebhookUrl || webhookInfo?.result?.url || null,
+        isUrlMatching: (config.registeredWebhookUrl || webhookInfo?.result?.url) === targetEndpoint,
+        webhookInfo: webhookInfo?.result || null,
       }));
       return;
     }
@@ -467,7 +688,7 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // -------------------------------------------------------------
     // POST /api/telegram/webhook-info
     // -------------------------------------------------------------
-    if (method === 'POST' && url === '/api/telegram/webhook-info') {
+    if (method === 'POST' && cleanPath === '/api/telegram/webhook-info') {
       const token = req.body?.botToken || getConfig().telegramBotToken;
       if (!token) {
         res.statusCode = 400;
@@ -491,7 +712,7 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // -------------------------------------------------------------
     // POST /api/sync-sheets (Manual / Bulk Sync to Google Sheets)
     // -------------------------------------------------------------
-    if (method === 'POST' && url === '/api/sync-sheets') {
+    if (method === 'POST' && cleanPath === '/api/sync-sheets') {
       const config = getConfig();
       const webhookUrl = req.body?.webhookUrl || config.googleSheetsWebhookUrl;
 
@@ -526,9 +747,103 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     }
 
     // -------------------------------------------------------------
+    // POST /api/sheets/pull (Pull/Import transactions recorded by 24/7 Apps Script)
+    // -------------------------------------------------------------
+    if (method === 'POST' && cleanPath === '/api/sheets/pull') {
+      const config = getConfig();
+      const webhookUrl = req.body?.webhookUrl || config.googleSheetsWebhookUrl;
+
+      if (!webhookUrl) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: false, error: 'Google Sheets Webhook URL belum diisi.' }));
+        return;
+      }
+
+      const result = await pullItemsFromGoogleSheets(webhookUrl);
+      if (!result.success) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: false, error: result.message }));
+        return;
+      }
+
+      const stats = syncExpensesFromSheets(result.items);
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        success: true,
+        message: result.message,
+        added: stats.added,
+        total: stats.total,
+        items: getExpenses(),
+      }));
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // POST /api/telegram/set-sheets-webhook (1-Click Connect Telegram directly to Google Apps Script 24/7)
+    // -------------------------------------------------------------
+    if (method === 'POST' && cleanPath === '/api/telegram/set-sheets-webhook') {
+      const config = getConfig();
+      const token = (req.body?.botToken || config.telegramBotToken || '').trim();
+      const sheetsUrl = (req.body?.sheetsUrl || config.googleSheetsWebhookUrl || '').trim();
+
+      if (!token) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: false, error: 'Bot Token Telegram belum diisi.' }));
+        return;
+      }
+
+      if (!sheetsUrl || !sheetsUrl.startsWith('https://script.google.com/')) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          success: false,
+          error: 'URL Google Apps Script tidak valid. Harus diawali dengan https://script.google.com/macros/s/.../exec',
+        }));
+        return;
+      }
+
+      // Stop local polling if active to prevent 409 conflict
+      await stopTelegramPolling();
+
+      // Register webhook to Google Apps Script URL
+      const tgRes = await setTelegramWebhook(token, sheetsUrl);
+      if (!tgRes.ok) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          success: false,
+          error: tgRes.description || 'Gagal mendaftarkan webhook ke Telegram.',
+        }));
+        return;
+      }
+
+      // Update config
+      updateConfig({
+        telegramBotToken: token,
+        googleSheetsWebhookUrl: sheetsUrl,
+        telegramMode: 'webhook',
+        registeredWebhookUrl: sheetsUrl,
+      });
+
+      const me = await getMe(token);
+
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        success: true,
+        message: '⚡ Mode 24/7 Always-On Berhasil Diaktifkan! Bot Telegram sekarang terhubung langsung ke Google Apps Script di cloud Google, aktif 24 jam nonstop tanpa perlu buka AI Studio!',
+        webhookUrl: sheetsUrl,
+        botInfo: me.result || null,
+      }));
+      return;
+    }
+
+    // -------------------------------------------------------------
     // GET /api/export-csv
     // -------------------------------------------------------------
-    if (method === 'GET' && (url === '/api/export-csv' || url.startsWith('/api/export-csv?'))) {
+    if (method === 'GET' && cleanPath === '/api/export-csv') {
       const items = getExpenses();
       const csv = generateCsvContent(items);
 
@@ -541,7 +856,7 @@ export async function handleApiRequest(req: Request, res: Response): Promise<voi
     // Not found
     res.statusCode = 404;
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'Endpoint API tidak ditemukan', url }));
+    res.end(JSON.stringify({ error: 'Endpoint API tidak ditemukan', url: rawUrl }));
   } catch (err: any) {
     console.error('API Error:', err);
     let friendlyMessage = err?.message || 'Internal Server Error';

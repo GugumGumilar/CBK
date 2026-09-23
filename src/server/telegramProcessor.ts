@@ -7,10 +7,12 @@ import {
   answerCallbackQuery,
   sendChatAction,
   downloadTelegramPhoto,
+  sendTelegramDocument,
   formatCurrencyIDR,
 } from './telegramService.ts';
 import {
   getConfig,
+  updateConfig,
   getExpenses,
   addExpenses,
   addReceipt,
@@ -20,7 +22,34 @@ import {
   GroceryItem,
 } from './storageService.ts';
 import { parseReceiptImage, parseTextExpense } from './geminiService.ts';
-import { syncItemsToGoogleSheets } from './sheetsService.ts';
+import {
+  syncItemsToGoogleSheets,
+  deleteItemsFromGoogleSheets,
+  updateItemInGoogleSheets,
+  clearAllFromGoogleSheets,
+  generateCsvContent,
+} from './sheetsService.ts';
+
+/**
+ * Deduplication tracker to prevent identical photos or duplicate webhooks from re-processing
+ * Stores file_unique_id or message_id with timestamp for 15 minutes.
+ */
+const recentProcessedPhotos = new Map<string, number>();
+
+function isPhotoAlreadyProcessed(key: string): boolean {
+  const now = Date.now();
+  // Cleanup entries older than 15 minutes
+  for (const [k, time] of recentProcessedPhotos.entries()) {
+    if (now - time > 15 * 60 * 1000) {
+      recentProcessedPhotos.delete(k);
+    }
+  }
+  if (recentProcessedPhotos.has(key)) {
+    return true;
+  }
+  recentProcessedPhotos.set(key, now);
+  return false;
+}
 
 /**
  * Render paginated list of grocery items with Edit and Delete inline buttons
@@ -85,7 +114,7 @@ export function renderExpensesListMessage(page = 0): {
   // Bottom shortcut row
   inlineKeyboard.push([
     { text: '📊 Rekap Pengeluaran', callback_data: 'cmd_rekap' },
-    { text: '🗑️ Hapus Semua Data', callback_data: 'ask_clear_all' },
+    { text: '🗑️ Hapus Semua', callback_data: 'ask_clear_all' },
   ]);
 
   return { text, replyMarkup: { inline_keyboard: inlineKeyboard } };
@@ -138,7 +167,7 @@ export function renderItemEditCard(itemId: string, returnPage = 0): {
 }
 
 /**
- * Render delete confirmation dialog for a single item
+ * Render delete confirmation dialog
  */
 export function renderDeleteConfirmation(itemId: string, returnPage = 0): {
   text: string;
@@ -153,7 +182,7 @@ export function renderDeleteConfirmation(itemId: string, returnPage = 0): {
     `🔢 *Jumlah:* ${item.qty} ${item.unit}\n` +
     `💰 *Total:* *${formatCurrencyIDR(item.total)}*\n` +
     `🏪 *Toko:* ${item.store} (${item.date})\n\n` +
-    `_Data akan dihapus dari daftar belanjaan._`;
+    `_Data akan dihapus dari aplikasi dan baris data Google Sheets juga ikut terhapus._`;
 
   const replyMarkup: TelegramInlineKeyboardMarkup = {
     inline_keyboard: [
@@ -168,50 +197,10 @@ export function renderDeleteConfirmation(itemId: string, returnPage = 0): {
 }
 
 /**
- * Render clear all expenses confirmation dialog
- */
-export function renderClearAllConfirmation(): {
-  text: string;
-  replyMarkup: TelegramInlineKeyboardMarkup;
-} {
-  const expenses = getExpenses();
-  const count = expenses.length;
-
-  if (count === 0) {
-    return {
-      text: `📋 *DATA BELANJAAN SUDAH KOSONG*\n\n` +
-        `Saat ini belum ada data belanjaan yang tersimpan. Tidak ada data yang perlu dihapus.`,
-      replyMarkup: {
-        inline_keyboard: [
-          [{ text: '🔄 Cek Daftar', callback_data: 'page:0' }],
-        ],
-      },
-    };
-  }
-
-  const text = `⚠️ *KONFIRMASI HAPUS SEMUA DATA BELANJAAN* ⚠️\n\n` +
-    `Saat ini tersimpan *${count} barang belanjaan* di database.\n\n` +
-    `❗ *PERINGATAN:* Tindakan ini akan mengosongkan *seluruh catatan belanjaan* Anda secara permanen!\n\n` +
-    `Apakah Anda yakin ingin menghapus SEMUA data belanja?`;
-
-  const replyMarkup: TelegramInlineKeyboardMarkup = {
-    inline_keyboard: [
-      [
-        { text: '🔥 Ya, Hapus SEMUA Data', callback_data: 'do_clear_all' },
-      ],
-      [
-        { text: '❌ Batal, Simpan Data', callback_data: 'page:0' },
-      ],
-    ],
-  };
-
-  return { text, replyMarkup };
-}
-
-/**
  * Handle callback queries (taps on Inline Keyboard buttons)
  */
 async function handleCallbackQuery(cb: TelegramCallbackQuery, botToken: string): Promise<void> {
+  const config = getConfig();
   const data = cb.data || '';
   const chatId = cb.message?.chat.id || cb.from.id;
   const messageId = cb.message?.message_id;
@@ -273,9 +262,26 @@ async function handleCallbackQuery(cb: TelegramCallbackQuery, botToken: string):
     const existing = getExpenses().find(i => i.id === itemId);
     const itemName = existing ? existing.name : 'Barang';
     const deleted = deleteExpense(itemId);
+    const config = getConfig();
+
+    let sheetsNote = '';
+    if (deleted && existing && config.googleSheetsWebhookUrl) {
+      try {
+        const syncDel = await deleteItemsFromGoogleSheets(
+          config.googleSheetsWebhookUrl,
+          [itemId],
+          [existing]
+        );
+        if (syncDel.success) {
+          sheetsNote = ' & Google Sheets';
+        }
+      } catch (e) {
+        console.error('Error deleting from sheets via TG callback:', e);
+      }
+    }
 
     if (deleted) {
-      await answerCallbackQuery(botToken, cb.id, `✅ "${itemName}" berhasil dihapus!`, false);
+      await answerCallbackQuery(botToken, cb.id, `✅ "${itemName}" berhasil dihapus dari daftar${sheetsNote}!`, false);
     } else {
       await answerCallbackQuery(botToken, cb.id, 'Item sudah tidak ada.', false);
     }
@@ -376,58 +382,166 @@ async function handleCallbackQuery(cb: TelegramCallbackQuery, botToken: string):
     const todayItems = expenses.filter(i => i.date === todayDate);
     const totalTodaySpend = todayItems.reduce((acc, it) => acc + (it.total || 0), 0);
 
+    let budgetSection = '';
+    if (config.monthlyBudget && config.monthlyBudget > 0) {
+      const budget = config.monthlyBudget;
+      const remaining = budget - totalMonthSpend;
+      const percentUsed = Math.min(100, Math.round((totalMonthSpend / budget) * 100));
+      const barLength = 10;
+      const filled = Math.min(barLength, Math.max(0, Math.round((percentUsed / 100) * barLength)));
+      const bar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
+      const statusIcon = remaining < 0 ? '🚨 *OVER BUDGET!*' : percentUsed >= 85 ? '⚠️ *Hampir Habis!*' : '✅ *Aman*';
+      budgetSection = `\n🎯 *Budget Bulanan:* *${formatCurrencyIDR(budget)}*\n` +
+        `📊 *Progress:* [${bar}] ${percentUsed}%\n` +
+        `💰 *Sisa Budget:* *${formatCurrencyIDR(remaining)}* (${statusIcon})\n`;
+    }
+
     const rekapText = `📊 *REKAP PENGELUARAN BELANJA*\n\n` +
       `📅 *Hari Ini:* *${formatCurrencyIDR(totalTodaySpend)}* (${todayItems.length} barang)\n` +
       `🗓️ *Bulan Ini (${currentMonth}):* *${formatCurrencyIDR(totalMonthSpend)}* (${thisMonthItems.length} barang)\n` +
+      budgetSection +
       `📦 *Total Keseluruhan:* ${expenses.length} item tercatat`;
 
     await sendTelegramMessage(botToken, chatId, rekapText, 'Markdown', {
       inline_keyboard: [
         [
+          { text: '📥 Download File Rekap (Excel/CSV)', callback_data: 'download_rekap' },
+        ],
+        [
           { text: '📋 Lihat Daftar Belanja', callback_data: 'page:0' },
-          { text: '🗑️ Hapus Semua Data', callback_data: 'ask_clear_all' },
+          { text: '🎯 Atur Budget', callback_data: 'cmd_budget_info' },
         ],
       ],
     });
     return;
   }
 
-  // 10. Ask Clear All Expenses
-  if (action === 'ask_clear_all') {
+  // 9A. Budget Info Callback
+  if (action === 'cmd_budget_info') {
     await answerCallbackQuery(botToken, cb.id);
-    const conf = renderClearAllConfirmation();
-    if (messageId) {
-      await editTelegramMessageText(botToken, chatId, messageId, conf.text, 'Markdown', conf.replyMarkup);
+    const expenses = getExpenses();
+    const currentMonth = new Date().toISOString().substring(0, 7);
+    const thisMonthItems = expenses.filter(i => i.date.startsWith(currentMonth));
+    const totalMonthSpend = thisMonthItems.reduce((acc, it) => acc + (it.total || 0), 0);
+    const budget = config.monthlyBudget || 0;
+
+    let text = `🎯 *PENGATURAN BUDGET BULANAN*\n\n`;
+    if (budget > 0) {
+      const remaining = budget - totalMonthSpend;
+      const percentUsed = Math.min(100, Math.round((totalMonthSpend / budget) * 100));
+      text += `💰 *Batas Bulan Ini:* *${formatCurrencyIDR(budget)}*\n` +
+        `💸 *Sudah Dibelanjakan:* *${formatCurrencyIDR(totalMonthSpend)}*\n` +
+        `💵 *Sisa Budget:* *${formatCurrencyIDR(remaining)}* (${100 - percentUsed}% tersisa)\n\n`;
     } else {
-      await sendTelegramMessage(botToken, chatId, conf.text, 'Markdown', conf.replyMarkup);
+      text += `Status: _Belum diatur_\n\n`;
     }
+    text += `Untuk mengatur atau mengubah batas budget bulanan, ketik di chat:\n` +
+      `\`/budget 3000000\` atau \`/budget 3jt\`\n\n` +
+      `_Ketik \`/budget 0\` untuk menonaktifkan._`;
+
+    await sendTelegramMessage(botToken, chatId, text, 'Markdown', {
+      inline_keyboard: [
+        [{ text: '📊 Rekap Belanja', callback_data: 'cmd_rekap' }],
+      ],
+    });
     return;
   }
 
-  // 11. Execute Clear All Expenses
-  if (action === 'do_clear_all') {
-    const deletedCount = clearAllExpenses();
-    await answerCallbackQuery(botToken, cb.id, `✅ Seluruh ${deletedCount} data belanja berhasil dihapus!`, false);
+  // 9B. Download Rekap File directly via Telegram Callback
+  if (action === 'download_rekap') {
+    await answerCallbackQuery(botToken, cb.id, '⏳ Menyiapkan file rekap CSV/Excel...');
+    const expenses = getExpenses();
+    if (expenses.length === 0) {
+      await sendTelegramMessage(botToken, chatId, 'ℹ️ Belum ada catatan belanja untuk didownload.', 'Markdown');
+      return;
+    }
 
-    const successText = `🗑️ *SEMUA DATA BELANJAAN BERHASIL DIHAPUS!*\n\n` +
-      `Total *${deletedCount} catatan belanja* telah dikosongkan dari database aplikasi.\n\n` +
-      `Catatan belanjaan Anda sekarang bersih dan siap digunakan kembali. 🛒\n\n` +
-      `📸 *Kirim foto bon belanjaan*, atau\n` +
-      `✍️ *Ketik manual* (contoh: \`Beras 5kg 75000\`).`;
+    await sendChatAction(botToken, chatId, 'upload_document');
+    const csvContent = generateCsvContent(expenses);
+    const filename = `rekap-belanja-${new Date().toISOString().split('T')[0]}.csv`;
+    const totalSpend = expenses.reduce((acc, it) => acc + (it.total || 0), 0);
+    const caption = `📥 *File Rekap Belanjaan* (${expenses.length} item)\n💰 *Total:* ${formatCurrencyIDR(totalSpend)}\n\n_Dapat langsung dibuka di Microsoft Excel, Google Sheets, atau Numbers di iPhone kamu!_`;
 
-    const successMarkup: TelegramInlineKeyboardMarkup = {
+    await sendTelegramDocument(botToken, chatId, csvContent, filename, caption);
+    return;
+  }
+
+  // 10. Ask Clear All Confirmation via Button
+  if (action === 'ask_clear_all') {
+    await answerCallbackQuery(botToken, cb.id);
+    const expenses = getExpenses();
+    const count = expenses.length;
+    if (count === 0) {
+      await sendTelegramMessage(botToken, chatId, 'ℹ️ Daftar belanjaan sudah kosong. Tidak ada data yang perlu dihapus.', 'Markdown');
+      return;
+    }
+
+    const totalSpend = expenses.reduce((acc, it) => acc + (it.total || 0), 0);
+    const config = getConfig();
+    const hasSheets = !!config.googleSheetsWebhookUrl;
+
+    const confText = `⚠️ *KONFIRMASI HAPUS SEMUA DATA BELANJA*\n\n` +
+      `Apakah Anda yakin ingin menghapus *seluruh catatan belanjaan*?\n\n` +
+      `📦 *Jumlah Catatan:* ${count} item\n` +
+      `💰 *Total Pengeluaran:* *${formatCurrencyIDR(totalSpend)}*\n` +
+      `📊 *Google Sheets:* ${hasSheets ? '✅ Baris di Google Sheets juga akan dikosongkan' : 'ℹ️ Belum terhubung'}\n\n` +
+      `_Peringatan: Tindakan ini tidak dapat dibatalkan._`;
+
+    const confMarkup: TelegramInlineKeyboardMarkup = {
       inline_keyboard: [
         [
-          { text: '📋 Buka Daftar Belanjaan', callback_data: 'page:0' },
-          { text: '📊 Rekap Pengeluaran', callback_data: 'cmd_rekap' },
+          { text: '🔴 Ya, Hapus Semua Data', callback_data: 'do_clear_all' },
+        ],
+        [
+          { text: '❌ Batal / Kembali', callback_data: 'page:0' },
         ],
       ],
     };
 
     if (messageId) {
-      await editTelegramMessageText(botToken, chatId, messageId, successText, 'Markdown', successMarkup);
+      await editTelegramMessageText(botToken, chatId, messageId, confText, 'Markdown', confMarkup);
     } else {
-      await sendTelegramMessage(botToken, chatId, successText, 'Markdown', successMarkup);
+      await sendTelegramMessage(botToken, chatId, confText, 'Markdown', confMarkup);
+    }
+    return;
+  }
+
+  // 11. Perform Clear All
+  if (action === 'do_clear_all') {
+    const count = getExpenses().length;
+    const config = getConfig();
+    let sheetsStatus = '';
+
+    if (config.googleSheetsWebhookUrl) {
+      try {
+        const clearRes = await clearAllFromGoogleSheets(config.googleSheetsWebhookUrl);
+        if (clearRes.success) {
+          sheetsStatus = '\n📊 *Google Sheets:* ✅ Seluruh baris data di Spreadsheet telah dikosongkan!';
+        } else {
+          sheetsStatus = `\n⚠️ *Google Sheets:* ${clearRes.message}`;
+        }
+      } catch (err: any) {
+        sheetsStatus = `\n⚠️ *Google Sheets:* Gagal membersihkan spreadsheet: ${err.message}`;
+      }
+    }
+
+    clearAllExpenses();
+    await answerCallbackQuery(botToken, cb.id, `✅ Seluruh ${count} item belanja berhasil dihapus!`, false);
+
+    const doneText = `🗑️ *SEMUA DATA BELANJA TELAH DIHAPUS*\n\n` +
+      `• Berhasil menghapus *${count} item* belanjaan dari aplikasi.${sheetsStatus}\n\n` +
+      `_Database kini bersih. Kirim foto bon belanja atau ketik catatan belanja baru kapan saja untuk mulai mencatat!_`;
+
+    const doneMarkup: TelegramInlineKeyboardMarkup = {
+      inline_keyboard: [
+        [{ text: '📋 Buka Daftar Belanja (Kosong)', callback_data: 'page:0' }],
+      ],
+    };
+
+    if (messageId) {
+      await editTelegramMessageText(botToken, chatId, messageId, doneText, 'Markdown', doneMarkup);
+    } else {
+      await sendTelegramMessage(botToken, chatId, doneText, 'Markdown', doneMarkup);
     }
     return;
   }
@@ -465,17 +579,25 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
 
   // B. CASE: USER SENT A RECEIPT PHOTO (OCR)
   if (msg.photo && msg.photo.length > 0) {
+    // Get the highest resolution photo from this specific message
+    const highestPhoto = msg.photo[msg.photo.length - 1];
+    const photoUniqueKey = highestPhoto.file_unique_id || highestPhoto.file_id || `msg-${msg.message_id}`;
+
+    // Prevent duplicate processing of the same photo
+    if (isPhotoAlreadyProcessed(photoUniqueKey)) {
+      console.log(`[Telegram OCR] Skipping duplicate photo: ${photoUniqueKey}`);
+      return;
+    }
+
     try {
       await sendChatAction(botToken, chatId, 'upload_photo');
       await sendTelegramMessage(
         botToken,
         chatId,
-        `🔍 *Menganalisis Bon Belanjaan...*\nAI sedang membaca foto struk belanjaan kamu. Mohon tunggu beberapa detik...`,
+        `🔍 *Menganalisis Bon Belanjaan...*\nAI sedang memindai foto struk belanjaan ini secara terpisah. Mohon tunggu beberapa detik...`,
         'Markdown'
       );
 
-      // Get the highest resolution photo
-      const highestPhoto = msg.photo[msg.photo.length - 1];
       const { base64, mimeType } = await downloadTelegramPhoto(botToken, highestPhoto.file_id);
 
       // Perform Gemini OCR
@@ -536,6 +658,22 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
         )
         .join('\n');
 
+      let budgetNotice = '';
+      if (config.monthlyBudget && config.monthlyBudget > 0) {
+        const currentMonth = (parsed.date || new Date().toISOString()).substring(0, 7);
+        const allExpenses = getExpenses();
+        const thisMonthSpend = allExpenses
+          .filter(i => i.date.startsWith(currentMonth))
+          .reduce((sum, i) => sum + (i.total || 0), 0);
+        const rem = config.monthlyBudget - thisMonthSpend;
+        const pct = Math.min(100, Math.round((thisMonthSpend / config.monthlyBudget) * 100));
+        if (rem < 0) {
+          budgetNotice = `\n🚨 *PERINGATAN BUDGET:* Terpakai ${pct}% (${formatCurrencyIDR(thisMonthSpend)} / ${formatCurrencyIDR(config.monthlyBudget)}). *Melebihi budget ${formatCurrencyIDR(Math.abs(rem))}!*\n`;
+        } else {
+          budgetNotice = `\n🎯 *Sisa Budget Bulan Ini:* *${formatCurrencyIDR(rem)}* (Terpakai ${pct}%)\n`;
+        }
+      }
+
       const responseText = `🧾 *STRUK BELANJA BERHASIL DICATAT!*\n\n` +
         `🏪 *Toko:* ${parsed.storeName}\n` +
         `📅 *Tanggal:* ${parsed.date}${parsed.time ? ` (${parsed.time})` : ''}\n` +
@@ -544,8 +682,9 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `💰 *Grand Total:* *${formatCurrencyIDR(parsed.grandTotal)}*\n` +
         (parsed.paymentMethod ? `💳 *Pembayaran:* ${parsed.paymentMethod}\n` : '') +
-        `${sheetsStatusText}\n\n` +
-        `_Ketik /daftar untuk melihat & mengedit barang yang sudah tercatat._`;
+        `${sheetsStatusText}\n` +
+        budgetNotice +
+        `\n_Ketik /daftar untuk melihat & mengedit barang yang sudah tercatat._`;
 
       await sendTelegramMessage(botToken, chatId, responseText, 'Markdown', {
         inline_keyboard: [
@@ -576,12 +715,14 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
       `Bot ini membantu kamu mencatat belanjaan dapur & rumah tangga dengan mudah langsung dari Telegram iPhone kamu!\n\n` +
       `📋 *Fitur & Perintah:* \n` +
       `• \`/daftar\` atau \`/lihat\` : *Lihat data belanja lengkap* dengan tombol *Edit (✏️)* dan *Hapus (🗑️)*\n` +
-      `• \`/rekap\` : Ringkasan total pengeluaran belanja\n` +
-      `• \`/hapussemua\` : *Hapus SEMUA data belanja* (dilengkapi konfirmasi aman)\n` +
-      `• \`/hapus <id>\` : Hapus 1 barang tertentu berdasarkan ID\n` +
+      `• \`/rekap\` : Ringkasan total pengeluaran belanja & status sisa budget\n` +
+      `• \`/budget <nominal>\` : Atur batas budget bulanan (misal \`/budget 3jt\` atau \`/budget 2500000\`)\n` +
+      `• \`/download\` : Unduh file rekap belanja (CSV / Excel) langsung ke chat\n` +
+      `• \`/hapus <ID>\` : Hapus satu barang tertentu\n` +
+      `• \`/hapus_semua\` : Hapus *seluruh data belanja* sekaligus & kosongkan Google Sheets\n` +
       `• \`/link\` : Buka dashboard web & spreadsheet live\n\n` +
       `📸 *1. Foto Bon / Struk Belanja (Otomatis OCR):*\n` +
-      `Ambil foto struk dari kamera iPhone kamu, AI langsung membaca item, jumlah, dan harganya secara otomatis!\n\n` +
+      `Ambil foto struk dari kamera iPhone kamu (kirim 1 atau 3 foto bon sekaligus), AI memindai masing-masing foto secara terpisah tanpa pengulangan!\n\n` +
       `✍️ *2. Input Manual Cepat:*\n` +
       `Ketik langsung daftar belanjaan kamu, contoh:\n` +
       `• \`Beras 5kg 75000\`\n` +
@@ -597,6 +738,7 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
           { text: '📊 Rekap Pengeluaran', callback_data: 'cmd_rekap' },
         ],
         [
+          { text: '📥 Download File Rekap', callback_data: 'download_rekap' },
           { text: '🗑️ Hapus Semua Data', callback_data: 'ask_clear_all' },
         ],
       ],
@@ -636,93 +778,271 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
     const summaryText = `📊 *REKAP PENGELUARAN BELANJA*\n\n` +
       `📅 *Hari Ini:* *${formatCurrencyIDR(totalTodaySpend)}* (${todayItems.length} barang)\n` +
       `🗓️ *Bulan Ini (${currentMonth}):* *${formatCurrencyIDR(totalMonthSpend)}* (${thisMonthItems.length} barang)\n` +
+      (config.monthlyBudget && config.monthlyBudget > 0
+        ? (() => {
+            const budget = config.monthlyBudget;
+            const remaining = budget - totalMonthSpend;
+            const percentUsed = Math.min(100, Math.round((totalMonthSpend / budget) * 100));
+            const barLength = 10;
+            const filledCount = Math.min(barLength, Math.max(0, Math.round((percentUsed / 100) * barLength)));
+            const bar = '█'.repeat(filledCount) + '░'.repeat(barLength - filledCount);
+            const statusIcon = remaining < 0 ? '🚨 *OVER BUDGET!*' : percentUsed >= 85 ? '⚠️ *Hampir Habis!*' : '✅ *Aman*';
+            return `🎯 *Budget Bulanan:* *${formatCurrencyIDR(budget)}*\n` +
+              `📊 *Progress:* [${bar}] ${percentUsed}%\n` +
+              `💰 *Sisa Budget:* *${formatCurrencyIDR(remaining)}* (${statusIcon})\n`;
+          })()
+        : `🎯 *Budget Bulanan:* _Belum diatur (Ketik /budget <nominal>)_\n`) +
       `📦 *Total Keseluruhan:* ${expenses.length} item tercatat\n\n` +
       `🕒 *5 Belanjaan Terakhir:*\n${recentList}\n\n` +
-      `_Gunakan tombol di bawah untuk melihat & mengedit seluruh data belanja._`;
+      `_Gunakan tombol di bawah untuk melihat & mengedit seluruh data belanja atau mengunduh file rekap._`;
 
     await sendTelegramMessage(botToken, chatId, summaryText, 'Markdown', {
       inline_keyboard: [
         [
+          { text: '📥 Download File Rekap (Excel/CSV)', callback_data: 'download_rekap' },
+        ],
+        [
           { text: '📋 Lihat Data Belanjaan Lengkap', callback_data: 'page:0' },
-          { text: '🗑️ Hapus Semua Data', callback_data: 'ask_clear_all' },
+          { text: '🎯 Atur Budget', callback_data: 'cmd_budget_info' },
         ],
       ],
     });
     return;
   }
 
-  // Command: Hapus SEMUA Data Belanja (/hapussemua, /hapus_semua, /cleardata, /clearall, /reset)
-  const lowerText = text.toLowerCase();
-  if (
-    lowerText === '/hapussemua' ||
-    lowerText.startsWith('/hapussemua ') ||
-    lowerText === '/hapus_semua' ||
-    lowerText.startsWith('/hapus_semua ') ||
-    lowerText === '/cleardata' ||
-    lowerText.startsWith('/cleardata ') ||
-    lowerText === '/clearall' ||
-    lowerText.startsWith('/clearall ') ||
-    lowerText === '/reset' ||
-    lowerText.startsWith('/reset ') ||
-    lowerText === '/clear' ||
-    lowerText.startsWith('/clear ') ||
-    lowerText === 'hapus semua' ||
-    lowerText === 'hapus semua data' ||
-    lowerText === 'reset data'
-  ) {
-    const isDirectlyConfirmed =
-      lowerText.includes('konfirmasi') ||
-      lowerText.includes('confirm') ||
-      lowerText.includes('ya') ||
-      lowerText.includes('force');
+  // Command: /budget or /anggaran
+  if (text.startsWith('/budget') || text.startsWith('/anggaran')) {
+    const parts = text.split(/\s+/);
+    const param = parts[1]?.trim();
 
-    if (isDirectlyConfirmed) {
-      const count = clearAllExpenses();
+    if (!param) {
+      const expenses = getExpenses();
+      const currentMonth = new Date().toISOString().substring(0, 7);
+      const thisMonthItems = expenses.filter(i => i.date.startsWith(currentMonth));
+      const totalMonthSpend = thisMonthItems.reduce((acc, it) => acc + (it.total || 0), 0);
+      const budget = config.monthlyBudget || 0;
+
+      let budgetMsg = `🎯 *PENGATURAN BUDGET BULANAN*\n\n`;
+      if (budget > 0) {
+        const remaining = budget - totalMonthSpend;
+        const percentUsed = Math.min(100, Math.round((totalMonthSpend / budget) * 100));
+        const barLength = 10;
+        const filled = Math.min(barLength, Math.max(0, Math.round((percentUsed / 100) * barLength)));
+        const bar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
+        const statusAlert = remaining < 0 ? '🚨 *Melebihi Batas Budget!*' : percentUsed >= 85 ? '⚠️ *Mendekati Batas!*' : '✅ *Masih Dalam Batas*';
+
+        budgetMsg += `💰 *Batas Budget:* *${formatCurrencyIDR(budget)}*\n` +
+          `💸 *Sudah Terpakai:* *${formatCurrencyIDR(totalMonthSpend)}* (${thisMonthItems.length} belanjaan)\n` +
+          `📊 *Progress:* [${bar}] ${percentUsed}%\n` +
+          `💵 *Sisa Budget:* *${formatCurrencyIDR(remaining)}* (${statusAlert})\n\n` +
+          `Untuk mengubah nominal budget, ketik:\n` +
+          `\`/budget <nominal>\` (contoh: \`/budget 3000000\` atau \`/budget 3jt\`)\n` +
+          `Ketik \`/budget 0\` untuk menonaktifkan.`;
+      } else {
+        budgetMsg += `Status: _Belum diatur_\n\n` +
+          `Atur batas pengeluaran bulanan agar kamu bisa memantau sisa uang belanja setiap saat!\n\n` +
+          `Cara mengatur:\n` +
+          `\`/budget 2500000\` atau \`/budget 2.5jt\`\n` +
+          `Contoh: \`/budget 3000000\``;
+      }
+
+      await sendTelegramMessage(botToken, chatId, budgetMsg, 'Markdown', {
+        inline_keyboard: [
+          [
+            { text: '📊 Lihat Rekap Belanja', callback_data: 'cmd_rekap' },
+          ],
+        ],
+      });
+      return;
+    }
+
+    // Parse budget amount (supports: 2.500.000, 2500000, 2.5jt, 2jt, 500k, 500rb)
+    let rawStr = param.toLowerCase().replace(/rp\.?/g, '').trim();
+    let multiplier = 1;
+    if (rawStr.includes('jt') || rawStr.includes('juta')) {
+      multiplier = 1000000;
+      rawStr = rawStr.replace(/jt|juta/g, '');
+    } else if (rawStr.includes('k') || rawStr.includes('rb') || rawStr.includes('ribu')) {
+      multiplier = 1000;
+      rawStr = rawStr.replace(/k|rb|ribu/g, '');
+    }
+    rawStr = rawStr.replace(/[.,]/g, match => (multiplier > 1 ? '.' : ''));
+    const parsedNum = parseFloat(rawStr) * multiplier;
+
+    if (isNaN(parsedNum) || parsedNum < 0) {
       await sendTelegramMessage(
         botToken,
         chatId,
-        `🗑️ *SEMUA DATA BELANJAAN BERHASIL DIHAPUS!*\n\n` +
-        `Total *${count} catatan belanja* telah dikosongkan dari database.\n` +
-        `Sekarang Anda siap mencatat belanjaan baru dari awal. 🛒`,
-        'Markdown',
-        {
-          inline_keyboard: [
-            [{ text: '📋 Cek Daftar Belanja', callback_data: 'page:0' }],
-          ],
-        }
+        `⚠️ *Format Budget Tidak Valid*\n\nContoh yang benar:\n• \`/budget 3000000\`\n• \`/budget 2.5jt\`\n• \`/budget 1500k\`\n• \`/budget 0\` (untuk menghapus batas)`,
+        'Markdown'
       );
       return;
     }
 
-    const conf = renderClearAllConfirmation();
-    await sendTelegramMessage(botToken, chatId, conf.text, 'Markdown', conf.replyMarkup);
+    const newBudget = Math.round(parsedNum);
+    updateConfig({ monthlyBudget: newBudget });
+
+    const expenses = getExpenses();
+    const currentMonth = new Date().toISOString().substring(0, 7);
+    const thisMonthItems = expenses.filter(i => i.date.startsWith(currentMonth));
+    const totalMonthSpend = thisMonthItems.reduce((acc, it) => acc + (it.total || 0), 0);
+
+    if (newBudget === 0) {
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `✅ *Batas Budget Bulanan Dinonaktifkan.*\nKamu tetap bisa mencatat belanjaan seperti biasa tanpa pembatasan budget.`,
+        'Markdown'
+      );
+    } else {
+      const remaining = newBudget - totalMonthSpend;
+      const percentUsed = Math.min(100, Math.round((totalMonthSpend / newBudget) * 100));
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `🎯 *BUDGET BULANAN BERHASIL DISIMPAN!*\n\n` +
+        `💰 *Batas Bulan Ini:* *${formatCurrencyIDR(newBudget)}*\n` +
+        `💸 *Sudah Dibelanjakan:* *${formatCurrencyIDR(totalMonthSpend)}*\n` +
+        `💵 *Sisa Budget Kamu:* *${formatCurrencyIDR(remaining)}* (${100 - percentUsed}% tersisa)\n\n` +
+        `_Bot akan otomatis mengupdate sisa budget setiap kali kamu memindai foto struk atau mencatat belanja baru!_`,
+        'Markdown',
+        {
+          inline_keyboard: [
+            [{ text: '📊 Rekap Belanja', callback_data: 'cmd_rekap' }],
+          ],
+        }
+      );
+    }
+    return;
+  }
+
+  // Command: /download, /export, /unduh, /unduh_rekap, /download_rekap, /csv, /excel
+  if (
+    text.startsWith('/download') ||
+    text.startsWith('/unduh') ||
+    text.startsWith('/export') ||
+    text.startsWith('/csv') ||
+    text.startsWith('/excel')
+  ) {
+    const expenses = getExpenses();
+    if (expenses.length === 0) {
+      await sendTelegramMessage(botToken, chatId, 'ℹ️ *Belum ada data belanjaan* yang tersimpan untuk didownload.', 'Markdown');
+      return;
+    }
+
+    await sendChatAction(botToken, chatId, 'upload_document');
+    const csvContent = generateCsvContent(expenses);
+    const filename = `rekap-belanja-${new Date().toISOString().split('T')[0]}.csv`;
+    const totalSpend = expenses.reduce((acc, it) => acc + (it.total || 0), 0);
+    const caption = `📥 *File Rekap Belanjaan* (${expenses.length} item)\n💰 *Total Pengeluaran:* *${formatCurrencyIDR(totalSpend)}*\n\n_File CSV dapat langsung dibuka di Microsoft Excel, Google Sheets, atau aplikasi Numbers di iPhone._`;
+
+    await sendTelegramDocument(botToken, chatId, csvContent, filename, caption);
+    return;
+  }
+
+  // Command: /hapus_semua, /hapussemua, /hapus semua, /reset, /clear_all
+  const lowerText = text.toLowerCase();
+  const isClearAllCmd =
+    lowerText === '/hapus_semua' ||
+    lowerText.startsWith('/hapus_semua ') ||
+    lowerText === '/hapussemua' ||
+    lowerText.startsWith('/hapussemua ') ||
+    lowerText === '/hapus semua' ||
+    lowerText.startsWith('/hapus semua ') ||
+    lowerText === '/reset' ||
+    lowerText.startsWith('/reset ') ||
+    lowerText === '/clear' ||
+    lowerText.startsWith('/clear ') ||
+    lowerText === '/clear_all' ||
+    lowerText.startsWith('/clear_all ') ||
+    lowerText === '/cleardata' ||
+    lowerText.startsWith('/cleardata ');
+
+  if (isClearAllCmd) {
+    const expenses = getExpenses();
+    const count = expenses.length;
+    if (count === 0) {
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `ℹ️ *Daftar Belanjaan Kosong*\n\nTidak ada catatan belanja yang tersimpan saat ini.`,
+        'Markdown'
+      );
+      return;
+    }
+
+    const parts = text.split(/\s+/);
+    // Check if user confirmed directly via text (e.g., "/hapus_semua konfirmasi" or "/hapus_semua ya")
+    const isConfirmed = parts.some(p => ['konfirmasi', 'confirm', 'ya', 'yes', 'ok'].includes(p.toLowerCase()));
+
+    if (!isConfirmed) {
+      const totalSpend = expenses.reduce((acc, it) => acc + (it.total || 0), 0);
+      const hasSheets = !!config.googleSheetsWebhookUrl;
+
+      const confText = `⚠️ *KONFIRMASI HAPUS SEMUA DATA BELANJA*\n\n` +
+        `Apakah Anda yakin ingin menghapus *seluruh catatan belanjaan*?\n\n` +
+        `📦 *Jumlah Catatan:* ${count} item\n` +
+        `💰 *Total Pengeluaran:* *${formatCurrencyIDR(totalSpend)}*\n` +
+        `📊 *Google Sheets:* ${hasSheets ? '✅ Seluruh baris di Spreadsheet juga akan dikosongkan' : 'ℹ️ Belum terhubung'}\n\n` +
+        `_Peringatan: Tindakan ini tidak dapat dibatalkan._\n` +
+        `_Silakan ketuk tombol di bawah untuk konfirmasi, atau ketik:_ \`/hapus_semua konfirmasi\``;
+
+      await sendTelegramMessage(botToken, chatId, confText, 'Markdown', {
+        inline_keyboard: [
+          [
+            { text: '🔴 Ya, Hapus Semua Data', callback_data: 'do_clear_all' },
+          ],
+          [
+            { text: '❌ Batal / Kembali', callback_data: 'page:0' },
+          ],
+        ],
+      });
+      return;
+    }
+
+    // Direct execution when confirmed
+    let sheetsStatus = '';
+    if (config.googleSheetsWebhookUrl) {
+      try {
+        const clearRes = await clearAllFromGoogleSheets(config.googleSheetsWebhookUrl);
+        if (clearRes.success) {
+          sheetsStatus = '\n📊 *Google Sheets:* ✅ Seluruh baris data di Spreadsheet telah dikosongkan!';
+        } else {
+          sheetsStatus = `\n⚠️ *Google Sheets:* ${clearRes.message}`;
+        }
+      } catch (err: any) {
+        sheetsStatus = `\n⚠️ *Google Sheets:* Gagal membersihkan spreadsheet: ${err.message}`;
+      }
+    }
+
+    clearAllExpenses();
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      `🗑️ *SEMUA DATA BELANJA TELAH DIHAPUS*\n\n` +
+      `• Berhasil menghapus *${count} item* belanjaan dari aplikasi.${sheetsStatus}\n\n` +
+      `_Database kini bersih. Kirim foto bon belanja atau ketik catatan belanja baru kapan saja untuk mulai mencatat!_`,
+      'Markdown',
+      {
+        inline_keyboard: [
+          [{ text: '📋 Buka Daftar Belanja', callback_data: 'page:0' }],
+        ],
+      }
+    );
     return;
   }
 
   // Command: /hapus <id>
-  if (lowerText === '/hapus' || lowerText.startsWith('/hapus ')) {
+  if (text.startsWith('/hapus')) {
     const parts = text.split(/\s+/);
     const itemId = parts[1]?.trim();
     if (!itemId) {
       await sendTelegramMessage(
         botToken,
         chatId,
-        `⚠️ *Pilihan Perintah Hapus Belanjaan:*\n\n` +
-        `1️⃣ *Hapus 1 Barang Tertentu:*\n` +
-        `   Ketik: \`/hapus <ID_BARANG>\`\n` +
-        `   Contoh: \`/hapus item-123\`\n\n` +
-        `2️⃣ *Hapus SEMUA Data Belanja:*\n` +
-        `   Ketik: \`/hapussemua\`\n\n` +
-        `💡 *Tips:* Ketik \`/daftar\` untuk menghapus atau mengedit langsung lewat tombol di layar!`,
-        'Markdown',
-        {
-          inline_keyboard: [
-            [
-              { text: '📋 Buka Daftar Belanja', callback_data: 'page:0' },
-              { text: '🗑️ Hapus Semua Data', callback_data: 'ask_clear_all' },
-            ],
-          ],
-        }
+        `⚠️ *Format Perintah Hapus:*\nKetik: \`/hapus <ID_BARANG>\`\n\nContoh: \`/hapus item-123\`\n\n_Atau ketik \`/daftar\` untuk menghapus via tombol interaktif!_`,
+        'Markdown'
       );
       return;
     }
@@ -734,10 +1054,29 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
     }
 
     deleteExpense(itemId);
+
+    let sheetsStatus = '';
+    if (config.googleSheetsWebhookUrl) {
+      try {
+        const syncRes = await deleteItemsFromGoogleSheets(
+          config.googleSheetsWebhookUrl,
+          [itemId],
+          [existing]
+        );
+        if (syncRes.success) {
+          sheetsStatus = '\n📊 *Google Sheets:* ✅ Baris data di Spreadsheet juga telah dihapus!';
+        } else {
+          sheetsStatus = `\n⚠️ *Google Sheets:* ${syncRes.message}`;
+        }
+      } catch (err: any) {
+        sheetsStatus = `\n⚠️ *Google Sheets:* Gagal menghapus baris spreadsheet: ${err.message}`;
+      }
+    }
+
     await sendTelegramMessage(
       botToken,
       chatId,
-      `✅ Berhasil menghapus barang: *${existing.name}* (${formatCurrencyIDR(existing.total)}).`,
+      `✅ Berhasil menghapus barang: *${existing.name}* (${formatCurrencyIDR(existing.total)}).${sheetsStatus}`,
       'Markdown',
       {
         inline_keyboard: [
@@ -935,12 +1274,29 @@ export async function processTelegramUpdate(update: TelegramUpdate): Promise<voi
       .map(it => `• *${it.name}* (${it.qty} ${it.unit}) : ${formatCurrencyIDR(it.total)}`)
       .join('\n');
 
+    let budgetNotice = '';
+    if (config.monthlyBudget && config.monthlyBudget > 0) {
+      const currentMonth = (parsed.date || new Date().toISOString()).substring(0, 7);
+      const allExpenses = getExpenses();
+      const thisMonthSpend = allExpenses
+        .filter(i => i.date.startsWith(currentMonth))
+        .reduce((sum, i) => sum + (i.total || 0), 0);
+      const rem = config.monthlyBudget - thisMonthSpend;
+      const pct = Math.min(100, Math.round((thisMonthSpend / config.monthlyBudget) * 100));
+      if (rem < 0) {
+        budgetNotice = `\n🚨 *PERINGATAN BUDGET:* Terpakai ${pct}% (${formatCurrencyIDR(thisMonthSpend)} / ${formatCurrencyIDR(config.monthlyBudget)}). *Melebihi budget ${formatCurrencyIDR(Math.abs(rem))}!*\n`;
+      } else {
+        budgetNotice = `\n🎯 *Sisa Budget Bulan Ini:* *${formatCurrencyIDR(rem)}* (Terpakai ${pct}%)\n`;
+      }
+    }
+
     const reply = `✅ *Belanjaan Berhasil Dicatat!*\n\n` +
       `🏪 *Toko:* ${parsed.storeName}\n` +
       `🛒 *Item:*\n${itemsList}\n\n` +
       `💰 *Total:* *${formatCurrencyIDR(parsed.grandTotal)}*\n` +
-      `${sheetsStatusText}\n\n` +
-      `_Ketik /daftar untuk melihat & mengedit barang._`;
+      `${sheetsStatusText}\n` +
+      budgetNotice +
+      `\n_Ketik /daftar untuk melihat & mengedit barang._`;
 
     await sendTelegramMessage(botToken, chatId, reply, 'Markdown', {
       inline_keyboard: [

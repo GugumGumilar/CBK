@@ -15,6 +15,8 @@ import {
   CheckCircle2,
   AlertCircle,
   TrendingUp,
+  Zap,
+  Target,
 } from 'lucide-react';
 import { GroceryItem, AppConfig, SystemStatus } from './types';
 import { SummaryStats } from './components/SummaryStats';
@@ -23,6 +25,7 @@ import { ReceiptScannerModal } from './components/ReceiptScannerModal';
 import { ManualInputModal } from './components/ManualInputModal';
 import { TelegramBotGuide } from './components/TelegramBotGuide';
 import { GoogleSheetsModal } from './components/GoogleSheetsModal';
+import { MonthlyBudgetModal } from './components/MonthlyBudgetModal';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'spreadsheet' | 'scanner' | 'telegram' | 'sheets'>('spreadsheet');
@@ -32,16 +35,19 @@ export default function App() {
     googleSheetsWebhookUrl: '',
     currency: 'IDR',
     autoSyncToSheets: true,
+    monthlyBudget: 0,
   });
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSyncingSheets, setIsSyncingSheets] = useState(false);
+  const [isPullingSheets, setIsPullingSheets] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'info' | 'error' } | null>(null);
 
   // Modals
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [isManualOpen, setIsManualOpen] = useState(false);
   const [isSheetsModalOpen, setIsSheetsModalOpen] = useState(false);
+  const [isBudgetModalOpen, setIsBudgetModalOpen] = useState(false);
 
   const showToast = (message: string, type: 'success' | 'info' | 'error' = 'success') => {
     setToast({ message, type });
@@ -108,11 +114,36 @@ export default function App() {
     try {
       const res = await fetch(`/api/expenses/${id}`, { method: 'DELETE' });
       if (res.ok) {
+        const data = await res.json();
         setItems(prev => prev.filter(i => i.id !== id));
-        showToast('Item berhasil dihapus dari catatan.');
+        if (data.sheetsDeleted) {
+          showToast(`"${data.itemName || 'Item'}" berhasil dihapus dari catatan & Google Sheets!`);
+        } else {
+          showToast('Item berhasil dihapus dari catatan.');
+        }
       }
     } catch (e) {
       showToast('Gagal menghapus item.', 'error');
+    }
+  };
+
+  // Handle Clear All
+  const handleClearAll = async () => {
+    try {
+      const res = await fetch('/api/expenses/clear-all', { method: 'DELETE' });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setItems([]);
+        if (data.sheetsCleared) {
+          showToast(`Berhasil menghapus ${data.count} item dari aplikasi & spreadsheet Google Sheets!`);
+        } else {
+          showToast(`Berhasil menghapus ${data.count} item dari catatan belanja.`);
+        }
+      } else {
+        showToast(data.message || 'Gagal menghapus data belanja.', 'error');
+      }
+    } catch (e: any) {
+      showToast(e.message || 'Gagal menghapus data belanja.', 'error');
     }
   };
 
@@ -177,6 +208,40 @@ export default function App() {
       showToast(e.message || 'Koneksi ke Google Sheets gagal.', 'error');
     } finally {
       setIsSyncingSheets(false);
+    }
+  };
+
+  // Pull / Import items from Google Sheets (Saved by 24/7 Bot)
+  const handlePullGoogleSheets = async () => {
+    if (!config.googleSheetsWebhookUrl) {
+      setIsSheetsModalOpen(true);
+      return;
+    }
+
+    setIsPullingSheets(true);
+    try {
+      const res = await fetch('/api/sheets/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ webhookUrl: config.googleSheetsWebhookUrl }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        if (Array.isArray(data.items)) {
+          setItems(data.items);
+        }
+        showToast(
+          data.added > 0
+            ? `Berhasil menarik ${data.added} belanjaan baru dari Google Sheets!`
+            : 'Data sudah up-to-date dengan Google Sheets!'
+        );
+      } else {
+        showToast(data.error || 'Gagal menarik data dari Google Sheets.', 'error');
+      }
+    } catch (e: any) {
+      showToast(e.message || 'Koneksi ke Google Sheets gagal.', 'error');
+    } finally {
+      setIsPullingSheets(false);
     }
   };
 
@@ -285,6 +350,26 @@ export default function App() {
               >
                 <FileSpreadsheet className="w-4 h-4" />
               </button>
+
+              {/* Monthly Budget Settings */}
+              <button
+                id="header-btn-budget"
+                onClick={() => setIsBudgetModalOpen(true)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors cursor-pointer ${
+                  config.monthlyBudget && config.monthlyBudget > 0
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
+                    : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                }`}
+                title="Atur Batas Budget Bulanan"
+              >
+                <Target className="w-3.5 h-3.5 text-emerald-600" />
+                <span className="hidden sm:inline">Budget</span>
+                {config.monthlyBudget && config.monthlyBudget > 0 && (
+                  <span className="text-[10px] bg-emerald-200/80 text-emerald-800 px-1.5 py-0.2 rounded-full font-bold">
+                    Aktif
+                  </span>
+                )}
+              </button>
             </div>
           </div>
 
@@ -315,7 +400,14 @@ export default function App() {
               <Smartphone className="w-3.5 h-3.5" />
               Panduan Bot Telegram iPhone
               {status?.botConfigured ? (
-                <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                status?.telegramMode === 'webhook' ? (
+                  <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-emerald-100 text-emerald-800">
+                    <Zap className="w-2.5 h-2.5" />
+                    Webhook
+                  </span>
+                ) : (
+                  <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                )
               ) : (
                 <span className="w-2 h-2 rounded-full bg-amber-500"></span>
               )}
@@ -345,18 +437,25 @@ export default function App() {
       {/* Main Content Area */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6">
         {/* Top Summary Stats */}
-        <SummaryStats items={items} />
+        <SummaryStats
+          items={items}
+          monthlyBudget={config.monthlyBudget || 0}
+          onOpenBudgetModal={() => setIsBudgetModalOpen(true)}
+        />
 
         {/* Dynamic Tab Content */}
         {activeTab === 'spreadsheet' && (
           <SpreadsheetView
             items={items}
             onDeleteItem={handleDeleteItem}
+            onClearAll={handleClearAll}
             onUpdateItem={handleUpdateItem}
             onOpenManualModal={() => setIsManualOpen(true)}
             onOpenScannerModal={() => setIsScannerOpen(true)}
             onSyncGoogleSheets={handleSyncGoogleSheets}
             isSyncingSheets={isSyncingSheets}
+            onPullGoogleSheets={handlePullGoogleSheets}
+            isPullingSheets={isPullingSheets}
             hasSheetsConfigured={!!config.googleSheetsWebhookUrl}
           />
         )}
@@ -370,6 +469,7 @@ export default function App() {
               await fetchStatus();
               await fetchExpenses();
             }}
+            onOpenSheetsModal={() => setIsSheetsModalOpen(true)}
           />
         )}
       </main>
@@ -402,6 +502,25 @@ export default function App() {
         onUpdateConfig={handleUpdateConfig}
         onSyncAll={handleSyncGoogleSheets}
         isSyncing={isSyncingSheets}
+        onPullAll={handlePullGoogleSheets}
+        isPulling={isPullingSheets}
+      />
+
+      <MonthlyBudgetModal
+        isOpen={isBudgetModalOpen}
+        onClose={() => setIsBudgetModalOpen(false)}
+        currentBudget={config.monthlyBudget || 0}
+        totalSpentThisMonth={items
+          .filter(i => i.date.startsWith(new Date().toISOString().substring(0, 7)))
+          .reduce((sum, it) => sum + (it.total || 0), 0)}
+        onSaveBudget={async (newBudget: number) => {
+          await handleUpdateConfig({ monthlyBudget: newBudget });
+          showToast(
+            newBudget > 0
+              ? `Batas budget bulanan Rp ${newBudget.toLocaleString('id-ID')} berhasil disimpan!`
+              : 'Batas budget bulanan dinonaktifkan.'
+          );
+        }}
       />
     </div>
   );

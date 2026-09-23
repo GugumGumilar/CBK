@@ -48,12 +48,21 @@ export interface AppConfig {
   autoSyncToSheets: boolean;
   appsScriptTemplate?: string;
   appUrl?: string;
+  telegramMode?: 'webhook' | 'polling';
+  registeredWebhookUrl?: string;
+  detectedPublicUrl?: string;
+  autoWebhookEnabled?: boolean;
+  monthlyBudget?: number;
 }
 
 export interface SystemStatus {
   status: string;
   hasGeminiKey: boolean;
   appUrl: string;
+  detectedPublicUrl?: string;
+  telegramMode?: 'webhook' | 'polling';
+  registeredWebhookUrl?: string | null;
+  autoWebhookEnabled?: boolean;
   botConfigured: boolean;
   botInfo?: {
     id: number;
@@ -66,6 +75,7 @@ export interface SystemStatus {
     pending_update_count: number;
     last_error_date?: number;
     last_error_message?: string;
+    last_synchronization_error_date?: number;
   } | null;
   isPolling?: boolean;
   pollingStatus?: {

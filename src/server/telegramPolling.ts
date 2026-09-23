@@ -74,21 +74,36 @@ export async function startTelegramPolling(): Promise<boolean> {
     await stopTelegramPolling();
   }
 
-  // Verify token first
-  try {
-    const me = await getMe(token);
-    if (!me.ok) {
-      console.warn('[Telegram Polling] Bot token is invalid:', me.description);
-      state.lastPollingError = me.description || 'Token tidak valid';
-      return false;
+  // Verify token first with retry
+  let meVerified = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const me = await getMe(token);
+      if (me.ok) {
+        meVerified = true;
+        if (me.result?.username && me.result.username !== config.botUsername) {
+          updateConfig({ botUsername: me.result.username });
+        }
+        console.log(`[Telegram Polling] Verified bot @${me.result?.username || 'unknown'}`);
+        break;
+      } else if (me.description?.includes('Unauthorized') || me.description?.includes('Not Found')) {
+        console.warn('[Telegram Polling] Bot token is invalid:', me.description);
+        state.lastPollingError = me.description || 'Token tidak valid';
+        return false;
+      } else {
+        // Transient Telegram server issue or timeout
+        console.warn(`[Telegram Polling] Attempt ${attempt}: Bot verify returned: ${me.description}`);
+        state.lastPollingError = me.description || 'Koneksi ke Telegram tertunda';
+        if (attempt < 3) await new Promise(r => setTimeout(r, 1500));
+      }
+    } catch (err: any) {
+      console.warn(`[Telegram Polling] Attempt ${attempt} network error verifying token:`, err.message);
+      state.lastPollingError = err.message;
+      if (attempt < 3) await new Promise(r => setTimeout(r, 1500));
     }
-    if (me.result?.username && me.result.username !== config.botUsername) {
-      updateConfig({ botUsername: me.result.username });
-    }
-    console.log(`[Telegram Polling] Verified bot @${me.result?.username || 'unknown'}`);
-  } catch (err: any) {
-    console.error('[Telegram Polling] Failed to verify token:', err);
-    state.lastPollingError = err.message;
+  }
+
+  if (!meVerified && state.lastPollingError?.toLowerCase().includes('unauthorized')) {
     return false;
   }
 
@@ -111,6 +126,7 @@ export async function startTelegramPolling(): Promise<boolean> {
     console.log(`[Telegram Polling] Started polling loop #${currentLoopId} for token: ${token.substring(0, 6)}...`);
 
     while (state.isPolling && state.currentToken === token && state.loopId === currentLoopId) {
+      let timeoutId: NodeJS.Timeout | null = null;
       try {
         state.abortController = new AbortController();
         const timeoutSeconds = 6;
@@ -118,9 +134,18 @@ export async function startTelegramPolling(): Promise<boolean> {
         const allowedUpdates = JSON.stringify(['message', 'edited_message', 'callback_query']);
         const url = `https://api.telegram.org/bot${token}/getUpdates?timeout=${timeoutSeconds}${offsetParam}&allowed_updates=${encodeURIComponent(allowedUpdates)}`;
 
+        // Timeout safety: 12 seconds max for a 6s long-poll call
+        timeoutId = setTimeout(() => {
+          try {
+            state.abortController?.abort();
+          } catch {}
+        }, 12000);
+
         const res = await fetch(url, {
           signal: state.abortController.signal,
         });
+
+        if (timeoutId) clearTimeout(timeoutId);
 
         if (!state.isPolling || state.loopId !== currentLoopId) break;
 
@@ -146,11 +171,14 @@ export async function startTelegramPolling(): Promise<boolean> {
           await new Promise(r => setTimeout(r, delay));
         }
       } catch (err: any) {
+        if (timeoutId) clearTimeout(timeoutId);
         if (err.name === 'AbortError' || !state.isPolling || state.loopId !== currentLoopId) {
-          break;
+          if (!state.isPolling || state.loopId !== currentLoopId) break;
+          // Normal timeout cycle on long poll, immediately continue loop
+          continue;
         }
         state.lastPollingError = err.message;
-        console.warn('[Telegram Polling] Network error in polling loop:', err.message);
+        console.warn('[Telegram Polling] Network notice in polling loop:', err.message);
         await new Promise(r => setTimeout(r, 2000));
       }
     }

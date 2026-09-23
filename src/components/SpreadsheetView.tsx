@@ -17,27 +17,34 @@ import {
   Camera,
   Layers,
   FileSpreadsheet,
+  AlertCircle,
 } from 'lucide-react';
 
 interface SpreadsheetViewProps {
   items: GroceryItem[];
   onDeleteItem: (id: string) => Promise<void>;
+  onClearAll?: () => Promise<void>;
   onUpdateItem: (id: string, updated: Partial<GroceryItem>) => Promise<void>;
   onOpenManualModal: () => void;
   onOpenScannerModal: () => void;
   onSyncGoogleSheets: () => Promise<void>;
   isSyncingSheets: boolean;
+  onPullGoogleSheets?: () => Promise<void>;
+  isPullingSheets?: boolean;
   hasSheetsConfigured: boolean;
 }
 
 export function SpreadsheetView({
   items,
   onDeleteItem,
+  onClearAll,
   onUpdateItem,
   onOpenManualModal,
   onOpenScannerModal,
   onSyncGoogleSheets,
   isSyncingSheets,
+  onPullGoogleSheets,
+  isPullingSheets,
   hasSheetsConfigured,
 }: SpreadsheetViewProps) {
   const [searchTerm, setSearchTerm] = useState('');
@@ -46,6 +53,10 @@ export function SpreadsheetView({
   const [sortBy, setSortBy] = useState<'date-desc' | 'date-asc' | 'price-desc' | 'price-asc' | 'name'>('date-desc');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<Partial<GroceryItem>>({});
+  const [deletingItem, setDeletingItem] = useState<GroceryItem | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [showClearAllModal, setShowClearAllModal] = useState(false);
+  const [isClearingAll, setIsClearingAll] = useState(false);
 
   // Categories list
   const categories = [
@@ -213,23 +224,51 @@ export function SpreadsheetView({
             <button
               id="btn-download-csv"
               onClick={handleDownloadCsv}
-              title="Download CSV untuk dibuka di Google Sheets atau Microsoft Excel"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-50 active:bg-slate-100 border border-slate-300 text-slate-700 rounded-lg text-xs font-semibold shadow-2xs transition-colors cursor-pointer"
+              title="Download File Rekap Belanja (CSV / Excel) untuk seluruh catatan"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 hover:bg-blue-100 active:bg-blue-200 border border-blue-200 text-blue-700 rounded-lg text-xs font-semibold shadow-2xs transition-colors cursor-pointer"
             >
-              <Download className="w-3.5 h-3.5 text-slate-500" />
-              Export CSV
+              <Download className="w-3.5 h-3.5 text-blue-600" />
+              Download Rekap
             </button>
 
-            {hasSheetsConfigured && (
+            {onClearAll && items.length > 0 && (
               <button
-                id="btn-sync-sheets"
-                onClick={onSyncGoogleSheets}
-                disabled={isSyncingSheets}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-semibold shadow-2xs transition-colors disabled:opacity-50 cursor-pointer"
+                id="btn-clear-all-expenses"
+                onClick={() => setShowClearAllModal(true)}
+                title="Hapus seluruh data belanjaan sekaligus dari aplikasi dan Google Sheets"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-50 hover:bg-rose-100 active:bg-rose-200 border border-rose-200 text-rose-700 rounded-lg text-xs font-semibold shadow-2xs transition-colors cursor-pointer"
               >
-                <RefreshCw className={`w-3.5 h-3.5 ${isSyncingSheets ? 'animate-spin' : ''}`} />
-                {isSyncingSheets ? 'Syncing...' : 'Sync Google Sheets'}
+                <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                Hapus Semua Data
               </button>
+            )}
+
+            {hasSheetsConfigured && (
+              <div className="flex items-center gap-1.5">
+                <button
+                  id="btn-sync-sheets"
+                  onClick={onSyncGoogleSheets}
+                  disabled={isSyncingSheets}
+                  title="Kirim semua data lokal ke Google Sheets"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-semibold shadow-2xs transition-colors disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingSheets ? 'animate-spin' : ''}`} />
+                  {isSyncingSheets ? 'Syncing...' : 'Sync ke Sheets'}
+                </button>
+
+                {onPullGoogleSheets && (
+                  <button
+                    id="btn-pull-sheets"
+                    onClick={onPullGoogleSheets}
+                    disabled={isPullingSheets}
+                    title="Tarik data belanjaan yang dicatat Bot 24/7 di Google Sheets"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-semibold shadow-2xs transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    <Download className={`w-3.5 h-3.5 ${isPullingSheets ? 'animate-spin' : ''}`} />
+                    {isPullingSheets ? 'Menarik...' : 'Tarik dari Sheets'}
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>
@@ -524,9 +563,9 @@ export function SpreadsheetView({
                         </button>
                         <button
                           id={`btn-delete-${item.id}`}
-                          onClick={() => onDeleteItem(item.id)}
+                          onClick={() => setDeletingItem(item)}
                           className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors cursor-pointer"
-                          title="Hapus item"
+                          title="Hapus item (dan baris Google Sheets)"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -558,11 +597,207 @@ export function SpreadsheetView({
         <div className="flex items-center gap-1.5">
           <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span>
           <span>Menampilkan {filteredItems.length} dari {items.length} total belanjaan</span>
+          {hasSheetsConfigured && (
+            <span className="ml-2 inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 bg-emerald-100/70 px-2 py-0.5 rounded-md">
+              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+              Sync Hapus Google Sheets Aktif
+            </span>
+          )}
         </div>
         <div className="text-[11px] text-slate-400">
-          💡 Tips iPhone: Foto struk langsung dari kamera Telegram untuk pencatatan instan
+          💡 Tips: Hapus data di sini atau via Telegram otomatis menghapus baris di Google Sheets
         </div>
       </div>
+
+      {/* Modal Konfirmasi Hapus Data */}
+      {deletingItem && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white w-full max-w-md rounded-2xl shadow-2xl border border-slate-200 overflow-hidden">
+            <div className="p-5 border-b border-slate-100 flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Hapus Data Belanjaan</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Konfirmasi penghapusan data dari catatan dan spreadsheet
+                </p>
+              </div>
+            </div>
+
+            <div className="p-5 space-y-3">
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-xs space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Nama Barang:</span>
+                  <span className="font-bold text-slate-900 text-sm">{deletingItem.name}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Toko:</span>
+                  <span className="text-slate-700">{deletingItem.store} ({deletingItem.date})</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Jumlah:</span>
+                  <span className="text-slate-700">{deletingItem.qty} {deletingItem.unit}</span>
+                </div>
+                <div className="flex justify-between items-center pt-1 border-t border-slate-200">
+                  <span className="text-slate-500">Total Harga:</span>
+                  <span className="font-bold text-emerald-700 font-mono text-sm">{formatIDR(deletingItem.total)}</span>
+                </div>
+              </div>
+
+              {hasSheetsConfigured ? (
+                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 flex items-start gap-2.5">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold">Sinkronisasi Hapus Google Sheets Aktif</p>
+                    <p className="text-[11px] text-emerald-700 mt-0.5 leading-relaxed">
+                      Baris data untuk <b>&quot;{deletingItem.name}&quot;</b> di Google Spreadsheet Anda juga akan otomatis dihapus.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-start gap-2.5">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-amber-700 leading-relaxed">
+                    Google Sheets belum dihubungkan. Item ini hanya akan dihapus dari database aplikasi.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeletingItem(null)}
+                disabled={isDeleting}
+                className="px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                id="btn-confirm-delete-item"
+                disabled={isDeleting}
+                onClick={async () => {
+                  setIsDeleting(true);
+                  try {
+                    await onDeleteItem(deletingItem.id);
+                  } finally {
+                    setIsDeleting(false);
+                    setDeletingItem(null);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-xs transition-colors cursor-pointer"
+              >
+                {isDeleting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Menghapus...
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Ya, Hapus Data
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear All Confirmation Modal */}
+      {showClearAllModal && onClearAll && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-md w-full overflow-hidden">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between bg-rose-50/50">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">Hapus Semua Data Belanja</h3>
+                  <p className="text-[11px] text-slate-500">Konfirmasi pembersihan seluruh catatan</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-5 space-y-3">
+              <p className="text-xs text-slate-700 leading-relaxed">
+                Apakah Anda yakin ingin menghapus <b>seluruh data belanjaan ({items.length} item)</b>? Tindakan ini tidak dapat dibatalkan.
+              </p>
+
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs space-y-1.5">
+                <div className="flex justify-between items-center text-slate-600">
+                  <span>Total Item:</span>
+                  <span className="font-bold text-slate-900">{items.length} barang</span>
+                </div>
+                <div className="flex justify-between items-center text-slate-600">
+                  <span>Total Pengeluaran:</span>
+                  <span className="font-bold text-emerald-700">{formatIDR(items.reduce((acc, it) => acc + (it.total || 0), 0))}</span>
+                </div>
+              </div>
+
+              {hasSheetsConfigured ? (
+                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 flex items-start gap-2.5">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold">Google Sheets Otomatis Dikosongkan</p>
+                    <p className="text-[11px] text-emerald-700 mt-0.5 leading-relaxed">
+                      Seluruh baris catatan belanja pada spreadsheet Google Sheets Anda juga akan dihapus bersih secara bersamaan.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-start gap-2.5">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-amber-700 leading-relaxed">
+                    Google Sheets belum dihubungkan. Seluruh data belanjaan hanya akan dihapus dari aplikasi ini.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowClearAllModal(false)}
+                disabled={isClearingAll}
+                className="px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                id="btn-confirm-clear-all"
+                disabled={isClearingAll}
+                onClick={async () => {
+                  setIsClearingAll(true);
+                  try {
+                    await onClearAll();
+                    setShowClearAllModal(false);
+                  } finally {
+                    setIsClearingAll(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-xs transition-colors cursor-pointer"
+              >
+                {isClearingAll ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Menghapus Semua...
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Ya, Hapus Semua Data
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

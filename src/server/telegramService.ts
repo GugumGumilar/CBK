@@ -28,6 +28,7 @@ export interface TelegramMessage {
   text?: string;
   photo?: TelegramPhotoSize[];
   caption?: string;
+  media_group_id?: string;
 }
 
 export interface TelegramInlineKeyboardButton {
@@ -54,29 +55,90 @@ export interface TelegramUpdate {
   callback_query?: TelegramCallbackQuery;
 }
 
+/**
+ * Fetch wrapper with timeout and retry handling for Telegram API
+ * Handles HeadersTimeoutError and transient network socket timeouts gracefully
+ */
+async function fetchWithTelegramTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs: number = 15000,
+  retries: number = 2
+): Promise<Response> {
+  let lastErr: any = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    // If caller provided a signal, link it
+    if (options.signal) {
+      options.signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      return res;
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      lastErr = err;
+      if (options.signal?.aborted) {
+        throw err;
+      }
+      // If headers timeout or network error, retry after brief delay
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 export async function getMe(botToken: string): Promise<{ ok: boolean; result?: any; description?: string }> {
   const url = `https://api.telegram.org/bot${botToken}/getMe`;
-  const res = await fetch(url);
-  return res.json();
+  try {
+    const res = await fetchWithTelegramTimeout(url, {}, 12000, 2);
+    return await res.json();
+  } catch (err: any) {
+    return {
+      ok: false,
+      description: err.name === 'AbortError' ? 'Koneksi ke Telegram timeout (coba lagi)' : (err.message || 'Koneksi gagal'),
+    };
+  }
 }
 
 export async function setTelegramWebhook(botToken: string, webhookUrl: string): Promise<{ ok: boolean; description?: string }> {
   const allowedUpdates = JSON.stringify(['message', 'edited_message', 'callback_query']);
   const url = `https://api.telegram.org/bot${botToken}/setWebhook?url=${encodeURIComponent(webhookUrl)}&allowed_updates=${encodeURIComponent(allowedUpdates)}`;
-  const res = await fetch(url);
-  return res.json();
+  try {
+    const res = await fetchWithTelegramTimeout(url, {}, 15000, 1);
+    return await res.json();
+  } catch (err: any) {
+    return { ok: false, description: err.message || 'Gagal mengatur webhook' };
+  }
 }
 
 export async function getWebhookInfo(botToken: string): Promise<any> {
   const url = `https://api.telegram.org/bot${botToken}/getWebhookInfo`;
-  const res = await fetch(url);
-  return res.json();
+  try {
+    const res = await fetchWithTelegramTimeout(url, {}, 12000, 1);
+    return await res.json();
+  } catch (err: any) {
+    return { ok: false, description: err.message || 'Gagal mengambil webhook info' };
+  }
 }
 
 export async function deleteTelegramWebhook(botToken: string): Promise<any> {
   const url = `https://api.telegram.org/bot${botToken}/deleteWebhook?drop_pending_updates=false`;
-  const res = await fetch(url);
-  return res.json();
+  try {
+    const res = await fetchWithTelegramTimeout(url, {}, 12000, 1);
+    return await res.json();
+  } catch (err: any) {
+    return { ok: false, description: err.message || 'Gagal menghapus webhook' };
+  }
 }
 
 export async function sendTelegramMessage(
@@ -205,7 +267,7 @@ export async function deleteTelegramMessage(
 export async function sendChatAction(
   botToken: string,
   chatId: number | string,
-  action: 'typing' | 'upload_photo' = 'typing'
+  action: 'typing' | 'upload_photo' | 'upload_document' = 'typing'
 ): Promise<any> {
   const url = `https://api.telegram.org/bot${botToken}/sendChatAction`;
   try {
@@ -219,6 +281,40 @@ export async function sendChatAction(
     });
   } catch (e) {
     // Ignore non-fatal action errors
+  }
+}
+
+/**
+ * Send a document/file (e.g. CSV or text) to Telegram chat
+ */
+export async function sendTelegramDocument(
+  botToken: string,
+  chatId: number | string,
+  fileContent: string | Uint8Array,
+  filename: string,
+  caption?: string
+): Promise<any> {
+  const url = `https://api.telegram.org/bot${botToken}/sendDocument`;
+  try {
+    const formData = new FormData();
+    formData.append('chat_id', String(chatId));
+    if (caption) {
+      formData.append('caption', caption);
+      formData.append('parse_mode', 'Markdown');
+    }
+
+    const payload = typeof fileContent === 'string' ? fileContent : new Uint8Array(fileContent);
+    const blob = new Blob([payload], { type: 'text/csv;charset=utf-8' });
+    formData.append('document', blob, filename);
+
+    const res = await fetch(url, {
+      method: 'POST',
+      body: formData,
+    });
+    return await res.json();
+  } catch (err: any) {
+    console.error('[Telegram Service] Error in sendTelegramDocument:', err);
+    return { ok: false, error: err.message };
   }
 }
 

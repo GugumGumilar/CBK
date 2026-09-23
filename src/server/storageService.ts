@@ -40,6 +40,11 @@ export interface AppConfig {
   currency: string;
   lastWebhookSync?: string;
   autoSyncToSheets: boolean;
+  telegramMode: 'webhook' | 'polling';
+  registeredWebhookUrl?: string;
+  autoWebhookEnabled?: boolean;
+  lastWebhookError?: string;
+  monthlyBudget?: number;
 }
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -56,6 +61,8 @@ let configCache: AppConfig = {
   googleSheetsWebhookUrl: process.env.GOOGLE_SHEETS_WEBHOOK_URL || '',
   currency: 'IDR',
   autoSyncToSheets: true,
+  telegramMode: 'webhook',
+  autoWebhookEnabled: true,
 };
 
 function ensureDataDir() {
@@ -149,8 +156,11 @@ const INITIAL_SAMPLE_EXPENSES: GroceryItem[] = [
   },
 ];
 
+let isDataLoaded = false;
+
 export function loadData() {
   ensureDataDir();
+  isDataLoaded = true;
 
   try {
     if (fs.existsSync(EXPENSES_FILE)) {
@@ -215,17 +225,19 @@ export function saveConfig() {
 
 // Data accessors
 export function getExpenses(): GroceryItem[] {
-  if (expensesCache.length === 0) loadData();
+  if (!isDataLoaded) loadData();
   return expensesCache;
 }
 
 export function addExpenses(items: GroceryItem[]): GroceryItem[] {
+  if (!isDataLoaded) loadData();
   expensesCache = [...items, ...expensesCache];
   saveExpenses();
   return expensesCache;
 }
 
 export function updateExpense(id: string, updated: Partial<GroceryItem>): GroceryItem | null {
+  if (!isDataLoaded) loadData();
   const index = expensesCache.findIndex(i => i.id === id);
   if (index === -1) return null;
   expensesCache[index] = { ...expensesCache[index], ...updated };
@@ -234,6 +246,7 @@ export function updateExpense(id: string, updated: Partial<GroceryItem>): Grocer
 }
 
 export function deleteExpense(id: string): boolean {
+  if (!isDataLoaded) loadData();
   const before = expensesCache.length;
   expensesCache = expensesCache.filter(i => i.id !== id);
   if (expensesCache.length !== before) {
@@ -243,17 +256,37 @@ export function deleteExpense(id: string): boolean {
   return false;
 }
 
-export function clearAllExpenses(): number {
-  const count = expensesCache.length;
+export function clearAllExpenses(): void {
+  if (!isDataLoaded) loadData();
   expensesCache = [];
   receiptsCache = [];
   saveExpenses();
   saveReceipts();
-  return count;
+}
+
+export function syncExpensesFromSheets(items: GroceryItem[]): { added: number; total: number } {
+  if (!isDataLoaded) loadData();
+  const existingMap = new Map<string, GroceryItem>();
+  for (const it of expensesCache) {
+    existingMap.set(it.id, it);
+  }
+  let added = 0;
+  for (const it of items) {
+    if (!existingMap.has(it.id)) {
+      expensesCache.push(it);
+      existingMap.set(it.id, it);
+      added++;
+    }
+  }
+  expensesCache.sort(
+    (a, b) => new Date(b.createdAt || b.date).getTime() - new Date(a.createdAt || a.date).getTime()
+  );
+  saveExpenses();
+  return { added, total: expensesCache.length };
 }
 
 export function getReceipts(): ReceiptRecord[] {
-  if (receiptsCache.length === 0) loadData();
+  if (!isDataLoaded) loadData();
   return receiptsCache;
 }
 

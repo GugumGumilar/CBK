@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { handleApiRequest } from './src/server/routes.ts';
 import { startTelegramPolling } from './src/server/telegramPolling.ts';
+import { getConfig } from './src/server/storageService.ts';
 
 dotenv.config();
 
@@ -32,5 +33,12 @@ app.get('*', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Catat Belanja Telegram & OCR Server running on http://0.0.0.0:${PORT}`);
-  startTelegramPolling().catch(err => console.error('Error starting telegram polling on startup:', err));
+  const config = getConfig();
+  if (config.telegramBotToken) {
+    if (config.telegramMode === 'polling') {
+      startTelegramPolling().catch(err => console.error('Error starting telegram polling on startup:', err));
+    } else {
+      console.log('[Startup] Telegram Bot configured in Automatic Webhook Mode.');
+    }
+  }
 });
